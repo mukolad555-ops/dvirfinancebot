@@ -1,789 +1,1368 @@
-import json
-import logging
 import os
 import re
-from datetime import date, datetime
+import uuid
+import logging
+from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
-from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import telebot
+
+# ============================================================
+# Dvir Finance Bot v2.2
+# Telegram + Supabase
+# ============================================================
 
 logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-logger = logging.getLogger("dvirfinancebot")
+log = logging.getLogger("dvir-finance")
 
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-TABLE_URL = f"{SUPABASE_URL}/rest/v1/cash_operations"
-OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-KYIV_TZ = ZoneInfo("Europe/Kyiv")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN")
+if not SUPABASE_URL:
+    raise RuntimeError("Не задано SUPABASE_URL")
+if not SUPABASE_KEY:
+    raise RuntimeError("Не задано SUPABASE_KEY")
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+KYIV = ZoneInfo("Europe/Kyiv")
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "return=minimal",
+    "Prefer": "return=representation",
 }
 
 CURRENCY_ALIASES = {
-    "UAH": ["грн", "гривень", "гривні", "гривня", "uah", "₴"],
-    "USD": ["дол", "долар", "доларів", "долари", "usd", "$"],
-    "EUR": ["євро", "евро", "eur", "€"],
+    "грн": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
+    "гривні": "UAH", "гривня": "UAH",
+    "дол": "USD", "долар": "USD", "долари": "USD", "доларів": "USD",
+    "usd": "USD", "$": "USD",
+    "євро": "EUR", "евро": "EUR", "eur": "EUR", "€": "EUR",
 }
 
-OPERATION_LABELS = {
-    "income": "Виручка",
-    "expense": "Витрата",
-    "exchange_in": "Обмін: надходження",
-    "exchange_out": "Обмін: видача",
-}
-
-HELP_TEXT = """
-Я веду внутрішній облік каси й уже розумію звичайні фрази українською та російською.
-
-Можна написати:
-• сьогодні заробили 20000 грн і 100 доларів
-• заплатили 1500 грн за доставку
-• поміняли 10000 грн на 230 доларів
-• яка зараз каса
-• покажи звіт за сьогодні
-• покажи звіт за місяць
-• покажи останні операції
-• видали останній запис
-
-Старі короткі команди теж працюють:
-• виручка
-• витрата
-• обмін
-• каса
-• звіт
-• звіт місяць
-• історія
-• видалити останню
-
-Важливо: борги, ревізія сейфа та картки будуть підключені наступним оновленням.
-""".strip()
+CURRENCY_SYMBOLS = {"UAH": "грн", "USD": "$", "EUR": "€"}
 
 
-def today_kyiv() -> date:
-    return datetime.now(KYIV_TZ).date()
+# ------------------------ Supabase ------------------------
 
-
-def normalize_number(raw: str) -> Decimal:
-    return Decimal(raw.replace(" ", "").replace("\u00a0", "").replace(",", "."))
-
-
-def find_amounts(text: str) -> List[Tuple[str, Decimal]]:
-    found: List[Tuple[str, Decimal]] = []
-    lowered = text.lower()
-
-    matches_with_positions = []
-    for currency, aliases in CURRENCY_ALIASES.items():
-        aliases_pattern = "|".join(
-            re.escape(alias) for alias in sorted(aliases, key=len, reverse=True)
-        )
-        pattern = rf"(\d+(?:[ \u00a0]\d{{3}})*(?:[.,]\d+)?)\s*(?:{aliases_pattern})"
-        for match in re.finditer(pattern, lowered, flags=re.IGNORECASE):
-            try:
-                matches_with_positions.append(
-                    (match.start(), currency, normalize_number(match.group(1)))
-                )
-            except InvalidOperation:
-                pass
-
-    matches_with_positions.sort(key=lambda item: item[0])
-    for _, currency, amount in matches_with_positions:
-        found.append((currency, amount))
-    return found
-
-
-def api_request(
-    method: str,
-    *,
-    params: Optional[dict] = None,
-    json_data: Optional[dict] = None,
-    prefer: Optional[str] = None,
-) -> requests.Response:
-    headers = dict(HEADERS)
-    if prefer:
-        headers["Prefer"] = prefer
-
+def sb_request(method: str, table: str, *, params=None, json=None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
     response = requests.request(
         method,
-        TABLE_URL,
-        headers=headers,
+        url,
+        headers=HEADERS,
         params=params,
-        json=json_data,
-        timeout=20,
+        json=json,
+        timeout=25,
     )
     if not response.ok:
-        logger.error("Supabase error %s: %s", response.status_code, response.text)
-        response.raise_for_status()
-    return response
+        log.error("Supabase %s %s: %s", method, table, response.text)
+        raise RuntimeError(response.text)
+    if not response.text:
+        return []
+    return response.json()
 
 
-def save_operation(
-    operation_type: str,
-    currency: str,
-    amount: Decimal,
-    description: str,
-    update: Update,
-) -> None:
-    user = update.effective_user
-    chat = update.effective_chat
+def sb_select(table: str, params: dict):
+    return sb_request("GET", table, params=params)
+
+
+def sb_insert(table: str, payload):
+    return sb_request("POST", table, json=payload)
+
+
+def sb_update(table: str, params: dict, payload: dict):
+    return sb_request("PATCH", table, params=params, json=payload)
+
+
+# ------------------------ Helpers ------------------------
+
+def today_str() -> str:
+    return datetime.now(KYIV).date().isoformat()
+
+
+def user_fields(message):
+    user = message.from_user
+    full_name = " ".join(
+        part for part in [user.first_name, user.last_name] if part
+    ).strip()
+    return {
+        "telegram_user_id": user.id,
+        "telegram_username": user.username,
+        "telegram_full_name": full_name or user.username or str(user.id),
+        "telegram_message_id": message.message_id,
+    }
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip())
+
+
+def parse_amount(raw: str) -> Decimal:
+    cleaned = raw.replace(" ", "").replace(",", ".")
+    try:
+        value = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise ValueError("Не вдалося прочитати суму") from exc
+    if value <= 0:
+        raise ValueError("Сума має бути більшою за нуль")
+    return value.quantize(Decimal("0.01"))
+
+
+def parse_currency(raw: str | None) -> str:
+    if not raw:
+        return "UAH"
+    key = raw.lower().strip().rstrip(".")
+    return CURRENCY_ALIASES.get(key, key.upper())
+
+
+def money(value, currency: str) -> str:
+    value = Decimal(str(value or 0))
+    number = f"{value:,.2f}".replace(",", " ").replace(".00", "")
+    return f"{number} {CURRENCY_SYMBOLS.get(currency, currency)}"
+
+
+def extract_amount_currency(text: str):
+    pattern = (
+        r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
+        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
+        r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?"
+    )
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError("Не бачу суму")
+    return (
+        parse_amount(match.group("amount")),
+        parse_currency(match.group("currency")),
+        match,
+    )
+
+
+def get_or_create_account(chat_id: int, account_name: str, currency: str, account_type="other"):
+    account_name = normalize_text(account_name)
+    rows = sb_select(
+        "cash_accounts",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "account_name": f"eq.{account_name}",
+            "currency": f"eq.{currency}",
+            "limit": "1",
+        },
+    )
+    if rows:
+        return rows[0]
+
+    created = sb_insert(
+        "cash_accounts",
+        {
+            "telegram_chat_id": chat_id,
+            "account_name": account_name,
+            "account_type": account_type,
+            "currency": currency,
+            "is_active": True,
+        },
+    )
+    return created[0]
+
+
+def account_from_text(text: str, currency: str = "UAH") -> tuple[str, str]:
+    """Recognize the money location named by the user."""
+    low = text.lower()
+
+    if "микол" in low and "карт" in low:
+        return "Картка Миколи", "personal_card"
+    if "андр" in low and "карт" in low:
+        return "Картка Андрія", "personal_card"
+    if "фоп" in low and "карт" in low:
+        return "ФОП-картка", "fop_card"
+
+    card_match = re.search(
+        r"карт(?:ка|ку|ці|ки|кою)\s+([а-яіїєґa-z'’-]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if card_match:
+        owner = normalize_text(card_match.group(1)).capitalize()
+        return f"Картка {owner}", "personal_card"
+
+    if currency == "USD" or "доларов" in low or "долларов" in low:
+        return "Доларова каса", "currency_cash"
+    if currency == "EUR" or "євров" in low or "евров" in low:
+        return "Євро каса", "currency_cash"
+
+    if any(word in low for word in ("загальн", "сейф", "готів", "налич", "каса")):
+        return "Загальна каса", "safe"
+
+    return "Загальна каса", "safe"
+
+
+def default_account_name(text: str, currency: str = "UAH") -> tuple[str, str]:
+    return account_from_text(text, currency)
+
+def operation_payload(message, operation_type, amount, currency, description, account_name=None):
     payload = {
-        "operation_date": today_kyiv().isoformat(),
+        "operation_date": today_str(),
         "operation_type": operation_type,
         "currency": currency,
         "amount": float(amount),
-        "description": description[:500],
-        "telegram_user_id": user.id if user else None,
-        "telegram_username": user.username if user else None,
-        "telegram_full_name": user.full_name if user else None,
-        "telegram_chat_id": chat.id if chat else None,
+        "operation_group": str(uuid.uuid4()),
+        "description": description or None,
+        "telegram_chat_id": message.chat.id,
+        "telegram_message_id": message.message_id,
+        "is_cancelled": False,
+        **user_fields(message),
     }
-    api_request("POST", json_data=payload)
+    if account_name:
+        account = get_or_create_account(
+            message.chat.id,
+            account_name,
+            currency,
+            "safe" if account_name == "Сейф" else "other",
+        )
+        payload["account_id"] = account["id"]
+        payload["account_name"] = account_name
+    return payload
 
 
-def fetch_operations(
-    chat_id: int,
-    *,
-    date_from: Optional[date] = None,
-) -> List[dict]:
-    params = {
-        "select": (
-            "id,created_at,operation_date,operation_type,currency,"
-            "amount,description,telegram_full_name"
+def sum_rows(rows, field="amount") -> Decimal:
+    total = Decimal("0")
+    for row in rows:
+        total += Decimal(str(row.get(field) or 0))
+    return total
+
+
+# ------------------------ Old cash operations ------------------------
+
+def add_cash_operation(message, operation_type: str, amount: Decimal, currency: str, description: str):
+    account_name, _ = default_account_name(description, currency)
+    sb_insert(
+        "cash_operations",
+        operation_payload(
+            message,
+            operation_type,
+            amount,
+            currency,
+            description,
+            account_name=account_name,
         ),
-        "telegram_chat_id": f"eq.{chat_id}",
-        "order": "id.desc",
+    )
+
+
+def handle_income_expense(message, text: str) -> bool:
+    low = text.lower()
+
+    income_words = ("виручка", "дохід", "доход", "прихід", "приход")
+    expense_words = ("витрата", "расход", "видаток", "витрати")
+
+    if low.startswith(income_words):
+        amount, currency, match = extract_amount_currency(text)
+        description = normalize_text(text[match.end():]) or "Виручка"
+        add_cash_operation(message, "income", amount, currency, description)
+        bot.reply_to(
+            message,
+            f"✅ Записано виручку: <b>{money(amount, currency)}</b>\n"
+            f"📍 Рахунок: {default_account_name(description, currency)[0]}\n"
+            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
+        )
+        return True
+
+    if low.startswith(expense_words):
+        amount, currency, match = extract_amount_currency(text)
+        description = normalize_text(text[match.end():]) or "Витрата"
+        add_cash_operation(message, "expense", amount, currency, description)
+        bot.reply_to(
+            message,
+            f"✅ Записано витрату: <b>{money(amount, currency)}</b>\n"
+            f"📝 {description}\n"
+            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
+        )
+        return True
+
+    return False
+
+
+# ------------------------ Transfers and currency exchange ------------------------
+
+def insert_paired_operations(message, first: dict, second: dict):
+    group_id = str(uuid.uuid4())
+    common = {
+        "operation_date": today_str(),
+        "operation_group": group_id,
+        "telegram_chat_id": message.chat.id,
+        "telegram_message_id": message.message_id,
+        "is_cancelled": False,
+        **user_fields(message),
     }
-    if date_from:
-        params["operation_date"] = f"gte.{date_from.isoformat()}"
-
-    return api_request("GET", params=params, prefer="count=none").json()
-
-
-def calculate_totals(rows: List[dict]) -> Dict[str, Dict[str, Decimal]]:
-    totals = {
-        "income": {"UAH": Decimal("0"), "USD": Decimal("0"), "EUR": Decimal("0")},
-        "expense": {"UAH": Decimal("0"), "USD": Decimal("0"), "EUR": Decimal("0")},
-        "balance": {"UAH": Decimal("0"), "USD": Decimal("0"), "EUR": Decimal("0")},
-    }
-    signs = {
-        "income": Decimal("1"),
-        "expense": Decimal("-1"),
-        "exchange_in": Decimal("1"),
-        "exchange_out": Decimal("-1"),
-    }
-
-    for row in rows:
-        currency = row.get("currency")
-        operation_type = row.get("operation_type")
-        if currency not in totals["balance"] or operation_type not in signs:
-            continue
-
-        amount = Decimal(str(row.get("amount", 0)))
-        totals["balance"][currency] += amount * signs[operation_type]
-
-        if operation_type == "income":
-            totals["income"][currency] += amount
-        elif operation_type == "expense":
-            totals["expense"][currency] += amount
-
-    return totals
-
-
-def get_balance(chat_id: int) -> Dict[str, Decimal]:
-    return calculate_totals(fetch_operations(chat_id))["balance"]
-
-
-def delete_last_operation(chat_id: int) -> Optional[dict]:
-    params = {
-        "select": "id,operation_type,currency,amount,description",
-        "telegram_chat_id": f"eq.{chat_id}",
-        "order": "id.desc",
-        "limit": "1",
-    }
-    rows = api_request("GET", params=params, prefer="count=none").json()
-    if not rows:
-        return None
-
-    row = rows[0]
-    api_request("DELETE", params={"id": f"eq.{row['id']}"})
-    return row
-
-
-def format_money(currency: str, amount: Decimal) -> str:
-    symbols = {"UAH": "грн", "USD": "$", "EUR": "€"}
-    value = f"{amount:,.2f}".replace(",", " ").replace(".00", "")
-    return f"{value} {symbols[currency]}"
-
-
-def totals_lines(values: Dict[str, Decimal]) -> str:
-    return "\n".join(
-        f"• {format_money(currency, values[currency])}"
-        for currency in ("UAH", "USD", "EUR")
-    )
-
-
-def extract_openai_text(response_json: dict) -> str:
-    direct = response_json.get("output_text")
-    if isinstance(direct, str) and direct.strip():
-        return direct.strip()
-
-    for item in response_json.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content in item.get("content", []):
-            if content.get("type") == "output_text":
-                text = content.get("text")
-                if isinstance(text, str) and text.strip():
-                    return text.strip()
-
-    raise RuntimeError("OpenAI не повернув текстову відповідь")
-
-
-def understand_with_ai(text: str) -> dict:
-    schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": [
-                    "income",
-                    "expense",
-                    "exchange",
-                    "cash",
-                    "report_today",
-                    "report_month",
-                    "history",
-                    "delete_last",
-                    "help",
-                    "unsupported_finance",
-                    "unknown",
-                ],
-            },
-            "amounts": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "currency": {
-                            "type": "string",
-                            "enum": ["UAH", "USD", "EUR"],
-                        },
-                        "amount": {"type": "number", "exclusiveMinimum": 0},
-                    },
-                    "required": ["currency", "amount"],
-                },
-            },
-            "from_amount": {
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "currency": {
-                                "type": "string",
-                                "enum": ["UAH", "USD", "EUR"],
-                            },
-                            "amount": {"type": "number", "exclusiveMinimum": 0},
-                        },
-                        "required": ["currency", "amount"],
-                    },
-                    {"type": "null"},
-                ]
-            },
-            "to_amount": {
-                "anyOf": [
-                    {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "currency": {
-                                "type": "string",
-                                "enum": ["UAH", "USD", "EUR"],
-                            },
-                            "amount": {"type": "number", "exclusiveMinimum": 0},
-                        },
-                        "required": ["currency", "amount"],
-                    },
-                    {"type": "null"},
-                ]
-            },
-            "description": {"type": "string"},
-            "reply": {"type": "string"},
-            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        },
-        "required": [
-            "action",
-            "amounts",
-            "from_amount",
-            "to_amount",
-            "description",
-            "reply",
-            "confidence",
-        ],
-    }
-
-    instructions = """
-Ти — класифікатор повідомлень для фінансового Telegram-бота.
-Користувачі пишуть українською, російською, суржиком і з помилками.
-
-Визнач одну дію:
-- income: надходження, виручка, заробили, отримали оплату.
-- expense: витрата, заплатили, купили, віддали гроші.
-- exchange: обмін однієї валюти на іншу.
-- cash: запит про поточну касу або баланс.
-- report_today: звіт за сьогодні.
-- report_month: звіт за місяць.
-- history: останні операції.
-- delete_last: видалити або скасувати останній запис.
-- help: допомога або що бот уміє.
-- unsupported_finance: борг, ревізія, сейф, картка, склад, прайс,
-  товарні залишки або інша фінансова дія, яку ця версія ще не записує.
-- unknown: нефінансове або незрозуміле повідомлення.
-
-Виправляй очевидні друкарські помилки за змістом.
-Наприклад, "викачка 10000 грн 150 доларів" найімовірніше означає
-"виручка 10000 грн 150 доларів" і має бути income.
-
-Для income та expense:
-- amounts містить усі суми.
-- from_amount і to_amount мають бути null.
-
-Для exchange:
-- amounts має бути порожнім.
-- from_amount — що віддали.
-- to_amount — що отримали.
-
-Не вигадуй сум і валют.
-Якщо сума не вказана або сенс неоднозначний, action=unknown.
-description — короткий зміст повідомлення мовою користувача.
-reply — коротке уточнення тільки для unknown або unsupported_finance.
-""".strip()
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": text,
-        "reasoning": {"effort": "low"},
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "financial_intent",
-                "strict": True,
-                "schema": schema,
-            }
-        },
-        "max_output_tokens": 600,
-        "store": False,
-    }
-
-    response = requests.post(
-        OPENAI_RESPONSES_URL,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=45,
-    )
-    if not response.ok:
-        logger.error("OpenAI error %s: %s", response.status_code, response.text)
-        response.raise_for_status()
-
-    return json.loads(extract_openai_text(response.json()))
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(HELP_TEXT)
-
-
-async def show_cash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.effective_chat:
-        return
-    await update.message.reply_text(
-        "💰 Поточна каса:\n" + totals_lines(get_balance(update.effective_chat.id))
-    )
-
-
-async def show_report(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    month: bool = False,
-) -> None:
-    if not update.message or not update.effective_chat:
-        return
-
-    today = today_kyiv()
-    date_from = today.replace(day=1) if month else today
-    totals = calculate_totals(
-        fetch_operations(update.effective_chat.id, date_from=date_from)
-    )
-    period = f"за {today.strftime('%m.%Y')}" if month else "за сьогодні"
-
-    await update.message.reply_text(
-        f"📊 Звіт {period}\n\n"
-        "💵 Виручка:\n"
-        + totals_lines(totals["income"])
-        + "\n\n"
-        "💸 Витрати:\n"
-        + totals_lines(totals["expense"])
-        + "\n\n"
-        "💰 Рух за період:\n"
-        + totals_lines(totals["balance"])
-    )
-
-
-async def show_history(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.message or not update.effective_chat:
-        return
-
-    rows = fetch_operations(update.effective_chat.id)[:10]
-    if not rows:
-        await update.message.reply_text("Історія поки порожня.")
-        return
-
-    lines = ["🧾 Останні операції:"]
-    for row in rows:
-        label = OPERATION_LABELS.get(
-            row["operation_type"],
-            row["operation_type"],
+    payloads = []
+    for item in (first, second):
+        account = get_or_create_account(
+            message.chat.id,
+            item["account_name"],
+            item["currency"],
+            item.get("account_type", "other"),
         )
-        amount = format_money(
-            row["currency"],
-            Decimal(str(row["amount"])),
-        )
-        description = (row.get("description") or "").strip()
-        author = (row.get("telegram_full_name") or "").strip()
-
-        if len(description) > 45:
-            description = description[:42] + "…"
-
-        extra = f"\n  {description}" if description else ""
-        if author:
-            extra += f"\n  Вніс: {author}"
-
-        lines.append(
-            f"• {row['operation_date']} — {label}: {amount}{extra}"
-        )
-
-    await update.message.reply_text("\n".join(lines))
+        payloads.append({
+            **common,
+            "operation_type": item["operation_type"],
+            "currency": item["currency"],
+            "amount": float(item["amount"]),
+            "description": item.get("description"),
+            "account_id": account["id"],
+            "account_name": item["account_name"],
+        })
+    sb_insert("cash_operations", payloads)
 
 
-async def remove_last(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.message or not update.effective_chat:
-        return
-
-    row = delete_last_operation(update.effective_chat.id)
-    if not row:
-        await update.message.reply_text("Немає операцій для видалення.")
-        return
-
-    label = OPERATION_LABELS.get(
-        row["operation_type"],
-        row["operation_type"],
-    )
-    amount = format_money(
-        row["currency"],
-        Decimal(str(row["amount"])),
-    )
-    await update.message.reply_text(
-        f"🗑 Видалено останню операцію:\n{label} — {amount}"
-    )
-
-
-async def execute_ai_intent(
-    intent: dict,
-    text: str,
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.message:
-        return
-
-    action = intent["action"]
-    confidence = Decimal(str(intent.get("confidence", 0)))
-
-    if confidence < Decimal("0.65") and action not in {
-        "cash",
-        "report_today",
-        "report_month",
-        "history",
-        "help",
-    }:
-        await update.message.reply_text(
-            "Я не впевнений, що правильно зрозумів. Напиши трохи точніше."
-        )
-        return
-
-    if action == "cash":
-        await show_cash(update, context)
-        return
-
-    if action == "report_today":
-        await show_report(update, context, month=False)
-        return
-
-    if action == "report_month":
-        await show_report(update, context, month=True)
-        return
-
-    if action == "history":
-        await show_history(update, context)
-        return
-
-    if action == "delete_last":
-        await remove_last(update, context)
-        return
-
-    if action == "help":
-        await update.message.reply_text(HELP_TEXT)
-        return
-
-    if action in {"income", "expense"}:
-        amounts = intent.get("amounts") or []
-        if not amounts:
-            await update.message.reply_text(
-                "Я зрозумів тип операції, але не бачу точної суми."
-            )
-            return
-
-        saved = []
-        for item in amounts:
-            currency = item["currency"]
-            amount = Decimal(str(item["amount"]))
-            save_operation(action, currency, amount, text, update)
-            saved.append(format_money(currency, amount))
-
-        label = "Виручку" if action == "income" else "Витрату"
-        await update.message.reply_text(
-            f"✅ {label} записано: " + ", ".join(saved)
-        )
-        return
-
-    if action == "exchange":
-        from_item = intent.get("from_amount")
-        to_item = intent.get("to_amount")
-        if not from_item or not to_item:
-            await update.message.reply_text(
-                "Зрозумів, що це обмін, але не бачу обидві суми."
-            )
-            return
-
-        from_currency = from_item["currency"]
-        from_amount = Decimal(str(from_item["amount"]))
-        to_currency = to_item["currency"]
-        to_amount = Decimal(str(to_item["amount"]))
-
-        save_operation(
-            "exchange_out",
-            from_currency,
-            from_amount,
-            text,
-            update,
-        )
-        save_operation(
-            "exchange_in",
-            to_currency,
-            to_amount,
-            text,
-            update,
-        )
-
-        await update.message.reply_text(
-            "✅ Обмін записано:\n"
-            f"− {format_money(from_currency, from_amount)}\n"
-            f"+ {format_money(to_currency, to_amount)}"
-        )
-        return
-
-    if action == "unsupported_finance":
-        reply = intent.get("reply") or (
-            "Я зрозумів зміст, але ця функція ще не підключена."
-        )
-        await update.message.reply_text(
-            "🧠 " + reply + "\n\n"
-            "Поки нічого не записав, щоб не перекрутити облік."
-        )
-        return
-
-    reply = intent.get("reply") or "Не зміг надійно зрозуміти повідомлення."
-    await update.message.reply_text(reply + "\n\n" + HELP_TEXT)
-
-
-async def handle_text(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    lowered = text.lower()
+def handle_transfer(message, text: str) -> bool:
+    low = text.lower()
+    transfer_words = ("переклав", "переклали", "переказав", "переказали", "перенесли", "зняли", "поклали")
+    if not any(word in low for word in transfer_words):
+        return False
+    if "помін" in low or "обмін" in low:
+        return False
 
     try:
-        # Швидкі старі команди залишаються без звернення до AI.
-        if lowered in {"каса", "баланс", "/cash"}:
-            await show_cash(update, context)
-            return
+        amount, currency, match = extract_amount_currency(text)
+    except ValueError:
+        return False
 
-        if lowered.startswith(("виручка", "дохід", "прихід")):
-            amounts = find_amounts(text)
-            if not amounts:
-                await update.message.reply_text(
-                    "Не бачу суму. Приклад: виручка 20000 грн 100 доларів"
-                )
-                return
-            for currency, amount in amounts:
-                save_operation("income", currency, amount, text, update)
-            await update.message.reply_text(
-                "✅ Виручку записано: "
-                + ", ".join(format_money(c, a) for c, a in amounts)
-            )
-            return
+    before = text[:match.start()]
+    after = text[match.end():]
 
-        if lowered.startswith(("витрата", "видаток", "розхід")):
-            amounts = find_amounts(text)
-            if not amounts:
-                await update.message.reply_text(
-                    "Не бачу суму. Приклад: витрата 1500 грн доставка"
-                )
-                return
-            for currency, amount in amounts:
-                save_operation("expense", currency, amount, text, update)
-            await update.message.reply_text(
-                "✅ Витрату записано: "
-                + ", ".join(format_money(c, a) for c, a in amounts)
-            )
-            return
+    source_match = re.search(r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|$)", before, flags=re.IGNORECASE)
+    destination_match = re.search(r"(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
 
-        if lowered.startswith(("обмін", "обмен", "поміняли", "поменяли")):
-            amounts = find_amounts(text)
-            if len(amounts) != 2:
-                await update.message.reply_text(
-                    "Приклад: обмін 10000 грн на 230 доларів"
-                )
-                return
-            (from_currency, from_amount), (to_currency, to_amount) = amounts
-            save_operation(
-                "exchange_out",
-                from_currency,
-                from_amount,
-                text,
-                update,
-            )
-            save_operation(
-                "exchange_in",
-                to_currency,
-                to_amount,
-                text,
-                update,
-            )
-            await update.message.reply_text(
-                "✅ Обмін записано:\n"
-                f"− {format_money(from_currency, from_amount)}\n"
-                f"+ {format_money(to_currency, to_amount)}"
-            )
-            return
-
-        if lowered in {"звіт", "звіт сьогодні", "отчет", "отчет сегодня"}:
-            await show_report(update, context, month=False)
-            return
-
-        if lowered in {
-            "звіт місяць",
-            "звіт за місяць",
-            "отчет месяц",
-            "отчет за месяц",
-        }:
-            await show_report(update, context, month=True)
-            return
-
-        if lowered in {
-            "історія",
-            "история",
-            "останні 10",
-            "последние 10",
-        }:
-            await show_history(update, context)
-            return
-
-        if lowered in {
-            "видалити останню",
-            "удалить последнюю",
-            "скасувати останню",
-            "отменить последнюю",
-        }:
-            await remove_last(update, context)
-            return
-
-        if lowered.startswith(("допомога", "що вмієш", "помощь")):
-            await update.message.reply_text(HELP_TEXT)
-            return
-
-        # Усе інше розбирає ChatGPT.
-        intent = understand_with_ai(text)
-        logger.info(
-            "AI intent action=%s confidence=%s text=%r",
-            intent.get("action"),
-            intent.get("confidence"),
-            text[:120],
+    # Common phrasing: "з картки Миколи зняли 10000 грн і поклали в загальну касу"
+    if not source_match:
+        source_match = re.search(
+            r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|\s+зняли|\s+переклали|\s+переказали|$)",
+            text,
+            flags=re.IGNORECASE,
         )
-        await execute_ai_intent(intent, text, update, context)
+    if not destination_match:
+        destination_match = re.search(r"(?:в|у|на|до)\s+(.+)$", text, flags=re.IGNORECASE)
 
-    except requests.HTTPError as exc:
-        logger.exception("Помилка зовнішнього API")
-        if exc.response is not None and exc.response.status_code == 401:
-            await update.message.reply_text(
-                "⚠️ OpenAI не прийняв API-ключ. Перевір OPENAI_API_KEY у Railway."
+    if not source_match or not destination_match:
+        return False
+
+    source_name, source_type = account_from_text(source_match.group(1), currency)
+    destination_name, destination_type = account_from_text(destination_match.group(1), currency)
+    if source_name == destination_name:
+        bot.reply_to(message, "⚠️ Рахунок відправника і отримувача однаковий. Операцію не записав.")
+        return True
+
+    description = f"Переказ: {source_name} → {destination_name}"
+    insert_paired_operations(
+        message,
+        {
+            "operation_type": "transfer_out",
+            "currency": currency,
+            "amount": amount,
+            "account_name": source_name,
+            "account_type": source_type,
+            "description": description,
+        },
+        {
+            "operation_type": "transfer_in",
+            "currency": currency,
+            "amount": amount,
+            "account_name": destination_name,
+            "account_type": destination_type,
+            "description": description,
+        },
+    )
+    bot.reply_to(
+        message,
+        f"✅ Переказ записано\n\n"
+        f"➖ {source_name}: {money(amount, currency)}\n"
+        f"➕ {destination_name}: {money(amount, currency)}\n\n"
+        "Загальна сума грошей не змінилася.",
+    )
+    return True
+
+
+def currency_named_after_na(text: str):
+    m = re.search(
+        r"\bна\s+(?:\d[\d\s]*(?:[.,]\d{1,2})?\s*)?"
+        r"(грн|гривні|гривень|uah|₴|долари|доларів|долар|usd|\$|євро|евро|eur|€)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return parse_currency(m.group(1)) if m else None
+
+
+def handle_exchange(message, text: str) -> bool:
+    low = text.lower()
+    if not any(word in low for word in ("помін", "обмін", "обмен", "конверт")):
+        return False
+
+    amounts = []
+    pattern = re.compile(
+        r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
+        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
+        flags=re.IGNORECASE,
+    )
+    for m in pattern.finditer(text):
+        amounts.append((m.start(), parse_amount(m.group("amount")), parse_currency(m.group("currency"))))
+
+    if not amounts:
+        return False
+
+    source_amount, source_currency = amounts[0][1], amounts[0][2]
+    target_currency = currency_named_after_na(text)
+    target_amount = None
+    if len(amounts) >= 2 and amounts[1][2] != source_currency:
+        target_amount, target_currency = amounts[1][1], amounts[1][2]
+
+    if not target_currency or target_currency == source_currency:
+        bot.reply_to(message, "⚠️ Не зрозумів, на яку валюту зробили обмін.")
+        return True
+
+    rate_match = re.search(r"(?:курс(?:ом)?|по\s+курсу)\s*[:=-]?\s*(\d+(?:[.,]\d+)?)", text, flags=re.IGNORECASE)
+    rate = parse_amount(rate_match.group(1)) if rate_match else None
+
+    if target_amount is None:
+        if rate is None:
+            bot.reply_to(
+                message,
+                "⚠️ Напиши курс або отриману суму. Наприклад: "
+                "<code>поміняли 100000 грн на долари по курсу 41,80</code>",
             )
-        elif exc.response is not None and exc.response.status_code == 429:
-            await update.message.reply_text(
-                "⚠️ OpenAI тимчасово обмежив запити або закінчився баланс API."
-            )
+            return True
+        if source_currency == "UAH" and target_currency in ("USD", "EUR"):
+            target_amount = (source_amount / rate).quantize(Decimal("0.01"))
+        elif target_currency == "UAH" and source_currency in ("USD", "EUR"):
+            target_amount = (source_amount * rate).quantize(Decimal("0.01"))
         else:
-            await update.message.reply_text(
-                "⚠️ Не вдалося звернутися до AI. Старі команди продовжують працювати."
-            )
-    except Exception:
-        logger.exception("Помилка обробки повідомлення")
-        await update.message.reply_text(
-            "⚠️ Сталася помилка. Подробиці записані в Railway Deploy Logs."
+            # For USD↔EUR the entered rate means target currency per 1 source currency.
+            target_amount = (source_amount * rate).quantize(Decimal("0.01"))
+
+    source_name, source_type = account_from_text(text.split("на", 1)[0], source_currency)
+    destination_name, destination_type = account_from_text(text.split("на", 1)[-1], target_currency)
+    description = (
+        f"Обмін {money(source_amount, source_currency)} → "
+        f"{money(target_amount, target_currency)}"
+        + (f", курс {rate}" if rate else "")
+    )
+    insert_paired_operations(
+        message,
+        {
+            "operation_type": "exchange_out",
+            "currency": source_currency,
+            "amount": source_amount,
+            "account_name": source_name,
+            "account_type": source_type,
+            "description": description,
+        },
+        {
+            "operation_type": "exchange_in",
+            "currency": target_currency,
+            "amount": target_amount,
+            "account_name": destination_name,
+            "account_type": destination_type,
+            "description": description,
+        },
+    )
+    bot.reply_to(
+        message,
+        f"✅ Обмін записано\n\n"
+        f"➖ {source_name}: {money(source_amount, source_currency)}\n"
+        f"➕ {destination_name}: {money(target_amount, target_currency)}"
+        + (f"\nКурс: {rate}" if rate else ""),
+    )
+    return True
+
+
+def handle_natural_expense(message, text: str) -> bool:
+    low = text.lower()
+    if low.startswith(("витрата", "расход", "видаток", "витрати")):
+        return False
+    if not re.search(r"\b(оплатили|оплатив|заплатили|заплатив|купили)\b", low):
+        return False
+    if not re.search(r"карт|каса|сейф|готів", low):
+        return False
+    try:
+        amount, currency, match = extract_amount_currency(text)
+    except ValueError:
+        return False
+    account_name, _ = account_from_text(text, currency)
+    description = normalize_text(text) or "Витрата"
+    sb_insert(
+        "cash_operations",
+        operation_payload(message, "expense", amount, currency, description, account_name=account_name),
+    )
+    bot.reply_to(
+        message,
+        f"✅ Записано витрату: <b>{money(amount, currency)}</b>\n"
+        f"📍 Рахунок: {account_name}\n"
+        f"📝 {description}",
+    )
+    return True
+
+
+# ------------------------ Revisions ------------------------
+
+def handle_revision(message, text: str) -> bool:
+    if not text.lower().startswith(("ревізія", "ревизия")):
+        return False
+
+    amount, currency, match = extract_amount_currency(text)
+    tail = normalize_text(text[match.end():])
+    account_name, account_type = default_account_name(tail, currency)
+    account = get_or_create_account(message.chat.id, account_name, currency, account_type)
+
+    previous = sb_select(
+        "cash_revisions",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{message.chat.id}",
+            "account_id": f"eq.{account['id']}",
+            "currency": f"eq.{currency}",
+            "order": "revision_date.desc,created_at.desc",
+            "limit": "1",
+        },
+    )
+    revision_type = "control" if previous else "opening"
+
+    created = sb_insert(
+        "cash_revisions",
+        {
+            "revision_date": today_str(),
+            "telegram_chat_id": message.chat.id,
+            "account_id": account["id"],
+            "account_name": account_name,
+            "currency": currency,
+            "actual_amount": float(amount),
+            "calculated_amount": None,
+            "difference_amount": None,
+            "revision_type": revision_type,
+            "description": tail or "Фактичний залишок",
+            **{k: v for k, v in user_fields(message).items() if k != "telegram_message_id"},
+        },
+    )[0]
+
+    label = "Початкову ревізію" if revision_type == "opening" else "Контрольну ревізію"
+    bot.reply_to(
+        message,
+        f"✅ {label} зафіксовано\n\n"
+        f"📍 {account_name}\n"
+        f"💰 <b>{money(created['actual_amount'], currency)}</b>\n"
+        f"📅 {today_str()}\n"
+        f"👤 {user_fields(message)['telegram_full_name']}",
+    )
+    return True
+
+
+# ------------------------ Debts ------------------------
+
+def create_debt(message, customer_name: str, amount: Decimal, currency: str, description: str):
+    payload = {
+        "debt_date": today_str(),
+        "telegram_chat_id": message.chat.id,
+        "customer_name": normalize_text(customer_name),
+        "description": description or None,
+        "currency": currency,
+        "original_amount": float(amount),
+        "paid_amount": 0,
+        "outstanding_amount": float(amount),
+        "status": "open",
+        "is_cancelled": False,
+        **user_fields(message),
+    }
+    return sb_insert("customer_debts", payload)[0]
+
+
+def handle_debt_create(message, text: str) -> bool:
+    low = text.lower()
+    if not low.startswith("борг "):
+        return False
+
+    # "борг Bolena 25000 грн полікарбонат"
+    rest = text[5:].strip()
+    amount, currency, match = extract_amount_currency(rest)
+    customer = normalize_text(rest[:match.start()])
+    description = normalize_text(rest[match.end():])
+
+    if not customer:
+        bot.reply_to(message, "Напиши ім’я покупця: <code>борг Bolena 25000 грн</code>")
+        return True
+
+    debt = create_debt(message, customer, amount, currency, description)
+    bot.reply_to(
+        message,
+        f"✅ Створено борг\n\n"
+        f"👤 <b>{debt['customer_name']}</b>\n"
+        f"💰 {money(debt['outstanding_amount'], currency)}\n"
+        f"📝 {description or 'Без опису'}\n"
+        f"📅 {today_str()}",
+    )
+    return True
+
+
+def find_open_debts(chat_id: int, customer_query: str | None = None):
+    params = {
+        "select": "*",
+        "telegram_chat_id": f"eq.{chat_id}",
+        "is_cancelled": "eq.false",
+        "status": "in.(open,partially_paid)",
+        "order": "debt_date.asc,created_at.asc",
+    }
+    rows = sb_select("customer_debts", params)
+    if customer_query:
+        query = customer_query.casefold()
+        rows = [r for r in rows if query in r["customer_name"].casefold()]
+    return rows
+
+
+def debt_list_text(rows):
+    if not rows:
+        return "✅ Відкритих боргів немає."
+
+    by_currency = {}
+    lines = ["📒 <b>Відкриті борги</b>\n"]
+    for row in rows:
+        curr = row["currency"]
+        amount = Decimal(str(row["outstanding_amount"]))
+        by_currency[curr] = by_currency.get(curr, Decimal("0")) + amount
+        desc = f" — {row['description']}" if row.get("description") else ""
+        lines.append(
+            f"• <b>{row['customer_name']}</b>: "
+            f"{money(amount, curr)} ({row['debt_date']}){desc}"
         )
 
+    lines.append("\n<b>Разом:</b>")
+    for curr, total in by_currency.items():
+        lines.append(f"• {money(total, curr)}")
+    return "\n".join(lines)
 
-def main() -> None:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("cash", show_cash))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("DvirFinanceBot AI v1 запущено, модель %s", OPENAI_MODEL)
-    app.run_polling(drop_pending_updates=True)
+def handle_debt_queries(message, text: str) -> bool:
+    low = text.lower().strip()
+
+    if low in ("борги", "хто нам винен", "хто винен"):
+        bot.reply_to(message, debt_list_text(find_open_debts(message.chat.id)))
+        return True
+
+    if low.startswith("борг ") and not re.search(r"\d", text):
+        customer = normalize_text(text[5:])
+        bot.reply_to(
+            message,
+            debt_list_text(find_open_debts(message.chat.id, customer)),
+        )
+        return True
+
+    return False
+
+
+def handle_debt_payment(message, text: str) -> bool:
+    payment_word = re.search(
+        r"\b(оплатив|оплатила|оплатили|заплатив|заплатила|погасив|погасила|"
+        r"приніс|принесла|закрив|закрила)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not payment_word:
+        return False
+
+    customer = normalize_text(text[:payment_word.start()])
+    if not customer:
+        return False
+
+    tail = text[payment_word.end():]
+    try:
+        amount, currency, match = extract_amount_currency(tail)
+    except ValueError:
+        return False
+
+    debts = find_open_debts(message.chat.id, customer)
+    debts = [d for d in debts if d["currency"] == currency]
+    if not debts:
+        bot.reply_to(
+            message,
+            f"Не знайшов відкритий борг для <b>{customer}</b> у валюті {currency}.",
+        )
+        return True
+
+    outstanding_total = sum_rows(debts, "outstanding_amount")
+    if amount > outstanding_total:
+        over = amount - outstanding_total
+        bot.reply_to(
+            message,
+            f"⚠️ Борг становить {money(outstanding_total, currency)}, "
+            f"а вказано {money(amount, currency)}.\n"
+            f"Переплата: {money(over, currency)}.\n"
+            "Поки операцію не записав.",
+        )
+        return True
+
+    destination_text = normalize_text(tail[match.end():])
+    account_name, account_type = default_account_name(destination_text)
+    account = get_or_create_account(message.chat.id, account_name, currency, account_type)
+
+    remaining_payment = amount
+    affected = []
+
+    for debt in debts:
+        if remaining_payment <= 0:
+            break
+
+        debt_remaining = Decimal(str(debt["outstanding_amount"]))
+        part = min(remaining_payment, debt_remaining)
+        new_paid = Decimal(str(debt["paid_amount"])) + part
+        new_outstanding = debt_remaining - part
+        new_status = "closed" if new_outstanding == 0 else "partially_paid"
+
+        sb_insert(
+            "debt_payments",
+            {
+                "payment_date": today_str(),
+                "telegram_chat_id": message.chat.id,
+                "debt_id": debt["id"],
+                "amount": float(part),
+                "currency": currency,
+                "destination_account_id": account["id"],
+                "destination_account_name": account_name,
+                "description": destination_text or f"Оплата боргу {debt['customer_name']}",
+                "is_cancelled": False,
+                **user_fields(message),
+            },
+        )
+
+        update_payload = {
+            "paid_amount": float(new_paid),
+            "outstanding_amount": float(new_outstanding),
+            "status": new_status,
+            "closed_at": datetime.now(KYIV).isoformat() if new_status == "closed" else None,
+        }
+        sb_update("customer_debts", {"id": f"eq.{debt['id']}"}, update_payload)
+        affected.append((debt["customer_name"], part))
+        remaining_payment -= part
+
+    left = outstanding_total - amount
+    bot.reply_to(
+        message,
+        f"✅ Оплату боргу записано\n\n"
+        f"👤 {customer}\n"
+        f"💰 Отримано: <b>{money(amount, currency)}</b>\n"
+        f"📍 Зараховано: {account_name}\n"
+        f"📒 Залишок боргу: {money(left, currency)}\n"
+        "ℹ️ У виручку повторно не додано.",
+    )
+    return True
+
+
+# ------------------------ Tenant payments ------------------------
+
+def tenant_category(text: str) -> str:
+    low = text.lower()
+    if any(word in low for word in ("комунал", "світло", "электро", "електро", "вода", "газ")):
+        return "Комунальні"
+    if any(word in low for word in ("оренда", "аренда", "рент")):
+        return "Оренда"
+    return "Інший платіж"
+
+
+def handle_tenant_payment(message, text: str) -> bool:
+    low = text.lower().strip()
+    if not low.startswith(("орендар ", "арендатор ")):
+        return False
+
+    prefix_len = len("орендар ") if low.startswith("орендар ") else len("арендатор ")
+    rest = text[prefix_len:].strip()
+    amount, currency, match = extract_amount_currency(rest)
+    tenant_name = normalize_text(rest[:match.start()])
+    details = normalize_text(rest[match.end():])
+
+    if not tenant_name:
+        bot.reply_to(message, "Напиши ім’я або кличку орендаря. Наприклад: <code>орендар Вася 12000 грн оренда</code>")
+        return True
+
+    category = tenant_category(details)
+    account_name = "Загальна каса"
+    description = f"Орендар: {tenant_name} | {category}"
+    if details:
+        description += f" | {details}"
+
+    sb_insert(
+        "cash_operations",
+        operation_payload(
+            message,
+            "income",
+            amount,
+            currency,
+            description,
+            account_name=account_name,
+        ),
+    )
+
+    bot.reply_to(
+        message,
+        f"✅ Платіж орендаря записано\n\n"
+        f"👤 <b>{tenant_name}</b>\n"
+        f"🏷 {category}\n"
+        f"💰 <b>{money(amount, currency)}</b>\n"
+        f"📍 Зараховано: {account_name}",
+    )
+    return True
+
+
+def tenant_payments_text(chat_id: int, tenant_query: str | None = None) -> str:
+    rows = sb_select(
+        "cash_operations",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "operation_type": "eq.income",
+            "description": "like.Орендар:*",
+            "is_cancelled": "eq.false",
+            "order": "operation_date.desc,created_at.desc",
+        },
+    )
+
+    if tenant_query:
+        q = tenant_query.casefold()
+        rows = [r for r in rows if q in (r.get("description") or "").casefold()]
+
+    if not rows:
+        return "Платежів орендарів поки немає."
+
+    totals = {}
+    lines = ["🏢 <b>Платежі орендарів</b>\n"]
+    for row in rows[:20]:
+        desc = row.get("description") or ""
+        parts = [part.strip() for part in desc.split("|")]
+        name = parts[0].replace("Орендар:", "").strip() if parts else "Орендар"
+        category = parts[1] if len(parts) > 1 else "Платіж"
+        curr = row["currency"]
+        amount = Decimal(str(row["amount"]))
+        totals[curr] = totals.get(curr, Decimal("0")) + amount
+        lines.append(f"• {row['operation_date']} — <b>{name}</b>: {money(amount, curr)} ({category})")
+
+    lines.append("\n<b>Разом за показані платежі:</b>")
+    for curr, total in totals.items():
+        lines.append(f"• {money(total, curr)}")
+    return "\n".join(lines)
+
+
+def handle_tenant_queries(message, text: str) -> bool:
+    low = text.lower().strip()
+    if low in ("орендарі", "арендатори", "платежі орендарів", "оплати орендарів"):
+        bot.reply_to(message, tenant_payments_text(message.chat.id))
+        return True
+
+    for prefix in ("платежі ", "оплати "):
+        if low.startswith(prefix):
+            name = normalize_text(text[len(prefix):])
+            if name:
+                bot.reply_to(message, tenant_payments_text(message.chat.id, name))
+                return True
+    return False
+
+
+# ------------------------ Daily closing ------------------------
+
+def parse_daily_closing(text: str):
+    lines = [normalize_text(line) for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    first = lines[0].lower()
+    if not (
+        first.startswith("виручка за день")
+        or first.startswith("закриття дня")
+        or first.startswith("закрытие дня")
+    ):
+        return None
+
+    total, currency, _ = extract_amount_currency(lines[0])
+    allocations = []
+    debts = []
+
+    for line in lines[1:]:
+        low = line.lower()
+        amount, curr, match = extract_amount_currency(line)
+        if curr != currency:
+            raise ValueError("У закритті дня всі суми мають бути в одній валюті")
+
+        if low.startswith(("у сейф", "в сейф", "сейф")):
+            allocations.append(("Сейф", "safe", amount))
+        elif "карт" in low:
+            # Take words after "картку/карту/картка"
+            m = re.search(r"карт(?:ку|ка|у|ці)\s*(.*?)(?=\s+\d|$)", line, re.IGNORECASE)
+            owner = normalize_text(m.group(1)) if m and m.group(1) else "Без назви"
+            allocations.append((f"Картка {owner}", "personal_card", amount))
+        elif low.startswith("борг "):
+            before_amount = normalize_text(line[5:match.start()])
+            after_amount = normalize_text(line[match.end():])
+            customer = before_amount
+            if not customer:
+                raise ValueError("У рядку боргу не вказано покупця")
+            debts.append((customer, amount, after_amount))
+        else:
+            raise ValueError(f"Не розумію рядок: {line}")
+
+    distributed = sum(a[2] for a in allocations) + sum(d[1] for d in debts)
+    return total, currency, allocations, debts, distributed
+
+
+def handle_daily_closing(message, text: str) -> bool:
+    try:
+        parsed = parse_daily_closing(text)
+    except ValueError as exc:
+        bot.reply_to(message, f"⚠️ {exc}")
+        return True
+
+    if not parsed:
+        return False
+
+    total, currency, allocations, debts, distributed = parsed
+    difference = total - distributed
+
+    if difference != 0:
+        label = "Не розподілено" if difference > 0 else "Розподілено зайве"
+        bot.reply_to(
+            message,
+            f"⚠️ Баланс не сходиться.\n\n"
+            f"Виручка: {money(total, currency)}\n"
+            f"Розподілено: {money(distributed, currency)}\n"
+            f"{label}: <b>{money(abs(difference), currency)}</b>\n\n"
+            "Нічого не записано.",
+        )
+        return True
+
+    existing = sb_select(
+        "daily_closings",
+        {
+            "select": "id",
+            "telegram_chat_id": f"eq.{message.chat.id}",
+            "closing_date": f"eq.{today_str()}",
+            "currency": f"eq.{currency}",
+            "is_cancelled": "eq.false",
+            "limit": "1",
+        },
+    )
+    if existing:
+        bot.reply_to(
+            message,
+            f"⚠️ Закриття дня за {today_str()} у валюті {currency} вже існує.",
+        )
+        return True
+
+    safe_total = sum(a[2] for a in allocations if a[1] == "safe")
+    card_total = sum(a[2] for a in allocations if a[1] != "safe")
+    debt_total = sum(d[1] for d in debts)
+
+    closing = sb_insert(
+        "daily_closings",
+        {
+            "closing_date": today_str(),
+            "telegram_chat_id": message.chat.id,
+            "currency": currency,
+            "total_revenue": float(total),
+            "cash_to_safe": float(safe_total),
+            "cash_to_cards": float(card_total),
+            "issued_as_debt": float(debt_total),
+            "difference_amount": 0,
+            "description": "Щоденне закриття",
+            "is_cancelled": False,
+            **user_fields(message),
+        },
+    )[0]
+
+    for name, account_type, amount in allocations:
+        account = get_or_create_account(message.chat.id, name, currency, account_type)
+        sb_insert(
+            "daily_closing_accounts",
+            {
+                "daily_closing_id": closing["id"],
+                "account_id": account["id"],
+                "account_name": name,
+                "amount": float(amount),
+            },
+        )
+
+    for customer, amount, description in debts:
+        create_debt(message, customer, amount, currency, description)
+
+    lines = [
+        "✅ <b>День закрито</b>",
+        "",
+        f"Загальна виручка: <b>{money(total, currency)}</b>",
+        f"У сейф: {money(safe_total, currency)}",
+        f"На картки: {money(card_total, currency)}",
+        f"Видано товару в борг: {money(debt_total, currency)}",
+        "",
+        "Баланс зійшовся.",
+    ]
+    bot.reply_to(message, "\n".join(lines))
+    return True
+
+
+# ------------------------ Cash summary ------------------------
+
+def latest_revisions(chat_id: int):
+    rows = sb_select(
+        "cash_revisions",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "order": "revision_date.desc,created_at.desc",
+        },
+    )
+    latest = {}
+    for row in rows:
+        key = (row["account_name"], row["currency"])
+        if key not in latest:
+            latest[key] = row
+    return latest
+
+
+def cash_summary(chat_id: int) -> str:
+    balances = {}
+
+    def add(account_name, currency, amount):
+        key = (account_name or "Сейф", currency)
+        balances[key] = balances.get(key, Decimal("0")) + Decimal(str(amount or 0))
+
+    revisions = latest_revisions(chat_id)
+    revision_dates = {}
+    for key, row in revisions.items():
+        balances[key] = Decimal(str(row["actual_amount"]))
+        revision_dates[key] = row["revision_date"]
+
+    operations = sb_select(
+        "cash_operations",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "order": "operation_date.asc,created_at.asc",
+        },
+    )
+    for row in operations:
+        key = (row.get("account_name") or "Сейф", row["currency"])
+        rev_date = revision_dates.get(key)
+        if rev_date and row["operation_date"] <= rev_date:
+            continue
+        if row["operation_type"] in ("income", "exchange_in", "transfer_in"):
+            sign = Decimal("1")
+        elif row["operation_type"] in ("expense", "exchange_out", "transfer_out"):
+            sign = Decimal("-1")
+        else:
+            continue
+        add(key[0], key[1], sign * Decimal(str(row["amount"])))
+
+    closings = sb_select(
+        "daily_closings",
+        {
+            "select": "id,closing_date,currency",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "order": "closing_date.asc",
+        },
+    )
+    closing_map = {str(c["id"]): c for c in closings}
+    if closing_map:
+        closing_accounts = sb_select(
+            "daily_closing_accounts",
+            {
+                "select": "*",
+                "daily_closing_id": f"in.({','.join(closing_map.keys())})",
+            },
+        )
+        for row in closing_accounts:
+            closing = closing_map.get(str(row["daily_closing_id"]))
+            if not closing:
+                continue
+            key = (row["account_name"], closing["currency"])
+            rev_date = revision_dates.get(key)
+            if rev_date and closing["closing_date"] <= rev_date:
+                continue
+            add(key[0], key[1], row["amount"])
+
+    payments = sb_select(
+        "debt_payments",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "order": "payment_date.asc",
+        },
+    )
+    for row in payments:
+        key = (row.get("destination_account_name") or "Сейф", row["currency"])
+        rev_date = revision_dates.get(key)
+        if rev_date and row["payment_date"] <= rev_date:
+            continue
+        add(key[0], key[1], row["amount"])
+
+    debts = find_open_debts(chat_id)
+    debt_totals = {}
+    for debt in debts:
+        curr = debt["currency"]
+        debt_totals[curr] = debt_totals.get(curr, Decimal("0")) + Decimal(
+            str(debt["outstanding_amount"])
+        )
+
+    lines = ["💰 <b>Фінансовий стан</b>\n"]
+    if balances:
+        lines.append("<b>Доступні гроші:</b>")
+        for (name, curr), amount in sorted(balances.items()):
+            lines.append(f"• {name}: {money(amount, curr)}")
+    else:
+        lines.append("Грошові залишки ще не внесені.")
+
+    lines.append("\n<b>Нам винні:</b>")
+    if debt_totals:
+        for curr, amount in debt_totals.items():
+            lines.append(f"• {money(amount, curr)}")
+    else:
+        lines.append("• Боргів немає")
+
+    return "\n".join(lines)
+
+
+# ------------------------ Reports/history ------------------------
+
+def report_text(chat_id: int):
+    rows = sb_select(
+        "cash_operations",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "operation_date": f"eq.{today_str()}",
+            "order": "created_at.asc",
+        },
+    )
+
+    totals = {}
+    for row in rows:
+        curr = row["currency"]
+        totals.setdefault(curr, {"income": Decimal("0"), "expense": Decimal("0")})
+        if row["operation_type"] == "income":
+            totals[curr]["income"] += Decimal(str(row["amount"]))
+        elif row["operation_type"] == "expense":
+            totals[curr]["expense"] += Decimal(str(row["amount"]))
+
+    closings = sb_select(
+        "daily_closings",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "closing_date": f"eq.{today_str()}",
+            "is_cancelled": "eq.false",
+        },
+    )
+    for closing in closings:
+        curr = closing["currency"]
+        totals.setdefault(curr, {"income": Decimal("0"), "expense": Decimal("0")})
+        totals[curr]["income"] += Decimal(str(closing["total_revenue"]))
+
+    if not totals:
+        return "За сьогодні операцій ще немає."
+
+    lines = [f"📊 <b>Звіт за {today_str()}</b>\n"]
+    for curr, data in totals.items():
+        lines.append(f"<b>{curr}</b>")
+        lines.append(f"Виручка: {money(data['income'], curr)}")
+        lines.append(f"Витрати: {money(data['expense'], curr)}")
+        lines.append(f"Рух: {money(data['income'] - data['expense'], curr)}\n")
+    return "\n".join(lines)
+
+
+def history_text(chat_id: int):
+    rows = sb_select(
+        "cash_operations",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "order": "created_at.desc",
+            "limit": "10",
+        },
+    )
+    if not rows:
+        return "Історія поки порожня."
+
+    lines = ["🕘 <b>Останні операції</b>\n"]
+    labels = {
+        "income": "Виручка",
+        "expense": "Витрата",
+        "exchange_in": "Обмін +",
+        "exchange_out": "Обмін −",
+        "transfer_in": "Переказ +",
+        "transfer_out": "Переказ −",
+    }
+    for row in rows:
+        who = row.get("telegram_full_name") or row.get("entered_by") or "невідомо"
+        lines.append(
+            f"• {row['operation_date']} — {labels.get(row['operation_type'], row['operation_type'])} "
+            f"{money(row['amount'], row['currency'])}\n"
+            f"  {row.get('description') or ''} · {who}"
+        )
+    return "\n".join(lines)
+
+
+# ------------------------ Commands ------------------------
+
+HELP_TEXT = """
+<b>Dvir Finance v2.2</b>
+
+Основні команди:
+
+<code>ревізія 125000 грн у сейфі</code>
+
+<code>виручка 25000 грн</code>
+<code>витрата 1200 грн бензин</code>
+<code>з картки Миколи оплатили 15000 грн за товар</code>
+
+<code>переклали 10000 грн з картки Миколи в загальну касу</code>
+<code>поміняли 100000 грн на долари по курсу 41,80</code>
+<code>поміняли 5000 доларів на євро по курсу 0,91</code>
+
+
+<code>орендар Вася 12000 грн оренда</code>
+<code>орендар Вася 2500 грн комуналка</code>
+<code>орендарі</code>
+<code>платежі Вася</code>
+
+<code>борг Bolena 5000 грн полікарбонат</code>
+<code>Bolena оплатила 3000 грн у сейф</code>
+<code>борги</code>
+<code>борг Bolena</code>
+
+Закриття дня одним повідомленням:
+<code>виручка за день 48000 грн
+у сейф 35000 грн
+на картку Миколи 8000 грн
+борг Bolena 5000 грн</code>
+
+<code>каса</code>
+<code>звіт</code>
+<code>історія</code>
+<code>видалити останню</code>
+<code>/id</code>
+""".strip()
+
+
+@bot.message_handler(commands=["start", "help"])
+def start_handler(message):
+    bot.reply_to(message, HELP_TEXT)
+
+
+@bot.message_handler(commands=["id"])
+def id_handler(message):
+    bot.reply_to(
+        message,
+        f"ID групи/чату: <code>{message.chat.id}</code>\n"
+        f"Ваш Telegram ID: <code>{message.from_user.id}</code>",
+    )
+
+
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def text_handler(message):
+    text = message.text.strip()
+    low = text.lower()
+
+    try:
+        if low in ("каса", "баланс", "скільки грошей", "яка загальна каса", "скільки всього грошей", "що маємо зараз"):
+            bot.reply_to(message, cash_summary(message.chat.id))
+            return
+
+        if low in ("звіт", "отчет"):
+            bot.reply_to(message, report_text(message.chat.id))
+            return
+
+        if low in ("історія", "история"):
+            bot.reply_to(message, history_text(message.chat.id))
+            return
+
+        if low in ("видалити останню", "удалить последнюю"):
+            rows = sb_select(
+                "cash_operations",
+                {
+                    "select": "*",
+                    "telegram_chat_id": f"eq.{message.chat.id}",
+                    "is_cancelled": "eq.false",
+                    "order": "created_at.desc",
+                    "limit": "1",
+                },
+            )
+            if not rows:
+                bot.reply_to(message, "Немає операції для видалення.")
+                return
+            row = rows[0]
+            sb_update(
+                "cash_operations",
+                {"id": f"eq.{row['id']}"},
+                {
+                    "is_cancelled": True,
+                    "cancelled_at": datetime.now(KYIV).isoformat(),
+                    "cancellation_reason": f"Скасовано користувачем {message.from_user.id}",
+                },
+            )
+            bot.reply_to(
+                message,
+                f"✅ Останню операцію скасовано: "
+                f"{money(row['amount'], row['currency'])}",
+            )
+            return
+
+        if handle_exchange(message, text):
+            return
+        if handle_transfer(message, text):
+            return
+        if handle_natural_expense(message, text):
+            return
+        if handle_daily_closing(message, text):
+            return
+        if handle_revision(message, text):
+            return
+        if handle_tenant_queries(message, text):
+            return
+        if handle_tenant_payment(message, text):
+            return
+        if handle_debt_queries(message, text):
+            return
+        if handle_debt_create(message, text):
+            return
+        if handle_debt_payment(message, text):
+            return
+        if handle_income_expense(message, text):
+            return
+
+        bot.reply_to(
+            message,
+            "Не зовсім зрозумів запис.\n\nНатисни /help або напиши, наприклад:\n"
+            "<code>витрата 1200 грн бензин</code>",
+        )
+
+    except Exception as exc:
+        log.exception("Помилка обробки повідомлення")
+        bot.reply_to(
+            message,
+            "⚠️ Не вдалося записати операцію. "
+            "Дані не втрачено. Спробуй ще раз або надішли скрін помилки.\n\n"
+            f"<code>{str(exc)[:300]}</code>",
+        )
 
 
 if __name__ == "__main__":
-    main()
+    log.info("Dvir Finance Bot v2.2 запущено")
+    bot.infinity_polling(
+        timeout=30,
+        long_polling_timeout=30,
+        skip_pending=True,
+        allowed_updates=["message"],
+    )
