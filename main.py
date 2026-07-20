@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v4.0 AI
+# Dvir Finance Bot v4.4 AI FINAL
 # Telegram + Supabase
 # ============================================================
 
@@ -204,22 +204,22 @@ def account_from_text(text: str, currency: str = "UAH") -> tuple[str, str]:
     if "андр" in low and "карт" in low:
         return "Картка Андрія", "personal_card"
 
-    # All cash currencies live in one logical account: Фастівська каса.
+    # All cash currencies live in one logical account: Каса.
     # Currency remains a separate field, so UAH, USD and EUR never mix.
-    return "Фастівська каса", "cash"
+    return "Каса", "cash"
 
 
 def display_account_name(account_name: str | None) -> str:
     """Merge old account names into the new compact three-account view."""
-    name = normalize_text(account_name or "Фастівська каса")
+    name = normalize_text(account_name or "Каса")
     low = name.lower()
     if "микол" in low and "карт" in low:
         return "Картка Миколи"
     if "андр" in low and "карт" in low:
         return "Картка Андрія"
     # Legacy names such as Сейф, Доларова каса and Євро каса are displayed
-    # inside one Фастівська каса, while their currencies stay separate.
-    return "Фастівська каса"
+    # inside one Каса, while their currencies stay separate.
+    return "Каса"
 
 def default_account_name(text: str, currency: str = "UAH") -> tuple[str, str]:
     return account_from_text(text, currency)
@@ -357,7 +357,7 @@ def handle_transfer(message, text: str) -> bool:
     source_match = re.search(r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|$)", before, flags=re.IGNORECASE)
     destination_match = re.search(r"(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
 
-    # Common phrasing: "з картки Миколи зняли 10000 грн і поклали в фастівську касу"
+    # Common phrasing: "з картки Миколи зняли 10000 грн і поклали в касу"
     if not source_match:
         source_match = re.search(
             r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|\s+зняли|\s+переклали|\s+переказали|$)",
@@ -543,41 +543,31 @@ def parse_all_amounts(text: str):
 
 
 def handle_evening_cash(message, text: str) -> bool:
-    """Record Fastivska and optional Bazaar daily amounts into the main cash ledger."""
+    """Record main cash and optional Bazaar daily amounts into the main cash ledger."""
     low = text.lower()
-    has_fastivska = any(x in low for x in ("фастівська", "фастовська", "фастівка"))
-    has_bazaar = "базар" in low
-    if not (has_fastivska or has_bazaar):
+    source_pattern = re.compile(
+        r"(?:базар(?:[-\s]*каса)?|на\s+базарі|фастівськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастовськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастівка|(?:(?:загальна|основна)\s+)?кас(?:а|і|у))",
+        flags=re.IGNORECASE,
+    )
+    markers = list(source_pattern.finditer(text))
+    if not markers or not re.search(r"\d", text):
         return False
 
-    # This handler is only for the concise evening format, not ordinary prose.
-    if not re.search(r"\d", text):
-        return False
-
-    normalized = text.replace(";", "\n")
-    # Split where the second source begins, while keeping the source word.
-    chunks = re.split(r"\n|,(?=\s*(?:базар|фаст))", normalized, flags=re.IGNORECASE)
     entries = []
-    for chunk in chunks:
-        chunk = normalize_text(chunk)
-        if not chunk:
-            continue
-        chunk_low = chunk.lower()
-        source = None
-        if "базар" in chunk_low:
-            source = "Базар"
-        elif any(x in chunk_low for x in ("фастівська", "фастовська", "фастівка")):
-            source = "Фастівська"
-        if not source:
-            continue
-        for amount, currency in parse_all_amounts(chunk):
+    for i, marker in enumerate(markers):
+        marker_text = marker.group(0).lower()
+        source = "Базар" if "базар" in marker_text else "Каса"
+        segment_start = marker.end()
+        segment_end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+        segment = text[segment_start:segment_end]
+        for amount, currency in parse_all_amounts(segment):
             entries.append((source, amount, currency))
 
     if not entries:
         return False
 
-    # Bazaar is only a daily sales indicator and is immediately included in main cash.
-    # It is not created as a separate balance account.
+    # Bazaar is only a daily sales indicator. Its amount is added immediately
+    # to the main cash balance and is never kept as a separate balance.
     for source, amount, currency in entries:
         sb_insert(
             "cash_operations",
@@ -587,7 +577,7 @@ def handle_evening_cash(message, text: str) -> bool:
                 amount,
                 currency,
                 f"Денна каса | {source}",
-                account_name="Фастівська каса",
+                account_name="Каса",
             ),
         )
 
@@ -596,17 +586,19 @@ def handle_evening_cash(message, text: str) -> bool:
         totals[currency] = totals.get(currency, Decimal("0")) + amount
 
     lines = ["✅ <b>Касу за день записано</b>", ""]
-    for source in ("Фастівська", "Базар"):
+    for source in ("Каса", "Базар"):
         source_rows = [(a, c) for s0, a, c in entries if s0 == source]
         if source_rows:
-            lines.append(f"{source}:")
+            lines.append(f"<b>{source}</b>")
             for amount, currency in source_rows:
                 lines.append(f"• {money(amount, currency)}")
-    lines.append("\nДодано у <b>Фастівську касу</b>:")
+            lines.append("")
+
+    lines.append("Додано у <b>касу</b>:")
     for currency in ("UAH", "USD", "EUR"):
         if currency in totals:
             lines.append(f"• {money(totals[currency], currency)}")
-    bot.reply_to(message, "\n".join(lines))
+    bot.reply_to(message, "\n".join(lines).strip())
     return True
 
 
@@ -629,20 +621,20 @@ def ai_normalize_command(text: str) -> str | None:
 You normalize Ukrainian/Russian bookkeeping messages for DvirFinance.
 Return one canonical command only; never invent amounts, names, currencies, accounts, or dates.
 Supported canonical forms:
-- фастівська 25000 грн, базар 3000 грн
+- каса 25000 грн, 300 $, 150 €, базар 3000 грн
 - виручка 25000 грн опис
 - витрата 1200 грн опис
 - з картки Миколи оплатили 1200 грн опис
-- переклали 10000 грн з картки Миколи в фастівську касу
+- переклали 10000 грн з картки Миколи в касу
 - поміняли 100000 грн на долари по курсу 41,80
 - орендар Вася 12000 грн оренда
 - борг Bolena 5000 грн опис
-- Bolena оплатила 3000 грн у фастівську касу
-- ревізія 125000 грн у фастівській касі
+- Bolena оплатила 3000 грн у касу
+- ревізія 125000 грн у касі
 - каса / борги / орендарі / платежі Ім'я / історія / видалити останню
 Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
 All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
-Bazaar is never a separate balance: its amount is daily sales added to Fastivska cash.
+Bazaar is never a separate balance: its amount is daily sales added immediately to the single general cash account named Каса.
 If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
 """.strip()
     payload = {
@@ -963,7 +955,7 @@ def handle_tenant_payment(message, text: str) -> bool:
         return True
 
     category = tenant_category(details)
-    account_name = "Фастівська каса"
+    account_name = "Каса"
     description = f"Орендар: {tenant_name} | {category}"
     if details:
         description += f" | {details}"
@@ -1280,7 +1272,7 @@ def cash_summary(chat_id: int) -> str:
         },
     )
     for row in payments:
-        key = (display_account_name(row.get("destination_account_name") or "Фастівська каса"), row["currency"])
+        key = (display_account_name(row.get("destination_account_name") or "Каса"), row["currency"])
         rev_date = revision_dates.get(key)
         if rev_date and row["payment_date"] <= rev_date:
             continue
@@ -1312,24 +1304,15 @@ def cash_summary(chat_id: int) -> str:
             tenant_names.add(first.casefold())
 
     lines = ["💰 <b>Фінансовий стан</b>"]
-    account_order = ["Фастівська каса", "Картка Миколи", "Картка Андрія"]
+    account_order = ["Каса", "Картка Миколи", "Картка Андрія"]
     currency_order = {"UAH": 0, "USD": 1, "EUR": 2}
 
-    if balances:
-        for account in account_order:
-            account_rows = [
-                (curr, amount)
-                for (name, curr), amount in balances.items()
-                if name == account and amount != 0
-            ]
-            if not account_rows:
-                continue
-            icon = "💵" if account == "Фастівська каса" else "💳"
-            lines.append(f"\n{icon} <b>{account}</b>")
-            for curr, amount in sorted(account_rows, key=lambda item: currency_order.get(item[0], 99)):
-                lines.append(money(amount, curr))
-    else:
-        lines.append("\nГрошові залишки ще не внесені.")
+    for account in account_order:
+        icon = "💵" if account == "Каса" else "💳"
+        lines.append(f"\n{icon} <b>{account}</b>")
+        currencies = ("UAH", "USD", "EUR") if account == "Каса" else ("UAH",)
+        for curr in currencies:
+            lines.append(money(balances.get((account, curr), Decimal("0")), curr))
 
     lines.append("\n🏢 <b>Орендарі</b>")
     lines.append(f"{len(tenant_names)} орендарів із зафіксованими платежами" if tenant_names else "Платежів ще немає")
@@ -1429,19 +1412,19 @@ def history_text(chat_id: int):
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v3.0 AI</b>
+<b>Dvir Finance v4.3 AI — остаточна версія</b>
 
 Основні команди:
 
-<code>ревізія 125000 грн у фастівській касі</code>
-<code>ревізія 1557 доларів у фастівській касі</code>
-<code>ревізія 305 євро у фастівській касі</code>
+<code>ревізія 125000 грн у касі</code>
+<code>ревізія 1557 доларів у касі</code>
+<code>ревізія 305 євро у касі</code>
 
 <code>виручка 25000 грн</code>
 <code>витрата 1200 грн бензин</code>
 <code>з картки Миколи оплатили 15000 грн за товар</code>
 
-<code>переклали 10000 грн з картки Миколи в фастівську касу</code>
+<code>переклали 10000 грн з картки Миколи в касу</code>
 <code>поміняли 100000 грн на долари по курсу 41,80</code>
 <code>поміняли 5000 доларів на євро по курсу 0,91</code>
 
@@ -1452,15 +1435,15 @@ HELP_TEXT = """
 <code>платежі Вася</code>
 
 <code>борг Bolena 5000 грн полікарбонат</code>
-<code>Bolena оплатила 3000 грн у фастівську касу</code>
+<code>Bolena оплатила 3000 грн у касу</code>
 <code>борги</code>
 <code>борг Bolena</code>
 
 Вечірня каса одним повідомленням:
-<code>фастівська 25000 грн, базар 3000 грн</code>
-<code>фастівська 25000 грн 500 доларів 200 євро</code>
+<code>каса 25000 грн, базар 3000 грн</code>
+<code>каса 25000 грн 500 доларів 200 євро</code>
 
-Базар — лише денний продаж. Його сума одразу додається у Фастівську касу.
+Базар — лише денний продаж. Його сума одразу додається у загальну касу.
 
 <code>каса</code>
 <code>звіт</code>
@@ -1574,7 +1557,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             message,
             "Не зовсім зрозумів запис. Дані не записував.\n\n"
             "Напиши, наприклад:\n"
-            "<code>фастівська 25000 грн, базар 3000 грн</code>\n"
+            "<code>каса 25000 грн, базар 3000 грн</code>\n"
             "або натисни /help",
         )
 
@@ -1589,7 +1572,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v4.0 AI запущено")
+    log.info("Dvir Finance Bot v4.4 AI FINAL запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
