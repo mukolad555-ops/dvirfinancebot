@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import logging
+import json
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -10,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v2.3
+# Dvir Finance Bot v4.0 AI
 # Telegram + Supabase
 # ============================================================
 
@@ -23,6 +24,13 @@ log = logging.getLogger("dvir-finance")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+WORKSPACE_CHAT_ID = os.getenv("WORKSPACE_CHAT_ID")
+OWNER_TELEGRAM_IDS = {
+    int(x.strip()) for x in (os.getenv("OWNER_TELEGRAM_IDS") or "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
 
 if not BOT_TOKEN:
     raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN")
@@ -51,6 +59,18 @@ CURRENCY_ALIASES = {
 
 CURRENCY_SYMBOLS = {"UAH": "грн", "USD": "$", "EUR": "€"}
 
+
+
+
+def workspace_id(message) -> int:
+    """Both owners can work from separate private chats in one shared ledger."""
+    if WORKSPACE_CHAT_ID and WORKSPACE_CHAT_ID.lstrip("-").isdigit():
+        return int(WORKSPACE_CHAT_ID)
+    return message.chat.id
+
+
+def is_authorized(message) -> bool:
+    return not OWNER_TELEGRAM_IDS or message.from_user.id in OWNER_TELEGRAM_IDS
 
 # ------------------------ Supabase ------------------------
 
@@ -184,22 +204,22 @@ def account_from_text(text: str, currency: str = "UAH") -> tuple[str, str]:
     if "андр" in low and "карт" in low:
         return "Картка Андрія", "personal_card"
 
-    # All cash currencies live in one logical account: Загальна каса.
+    # All cash currencies live in one logical account: Фастівська каса.
     # Currency remains a separate field, so UAH, USD and EUR never mix.
-    return "Загальна каса", "cash"
+    return "Фастівська каса", "cash"
 
 
 def display_account_name(account_name: str | None) -> str:
     """Merge old account names into the new compact three-account view."""
-    name = normalize_text(account_name or "Загальна каса")
+    name = normalize_text(account_name or "Фастівська каса")
     low = name.lower()
     if "микол" in low and "карт" in low:
         return "Картка Миколи"
     if "андр" in low and "карт" in low:
         return "Картка Андрія"
     # Legacy names such as Сейф, Доларова каса and Євро каса are displayed
-    # inside one Загальна каса, while their currencies stay separate.
-    return "Загальна каса"
+    # inside one Фастівська каса, while their currencies stay separate.
+    return "Фастівська каса"
 
 def default_account_name(text: str, currency: str = "UAH") -> tuple[str, str]:
     return account_from_text(text, currency)
@@ -212,14 +232,14 @@ def operation_payload(message, operation_type, amount, currency, description, ac
         "amount": float(amount),
         "operation_group": str(uuid.uuid4()),
         "description": description or None,
-        "telegram_chat_id": message.chat.id,
+        "telegram_chat_id": workspace_id(message),
         "telegram_message_id": message.message_id,
         "is_cancelled": False,
         **user_fields(message),
     }
     if account_name:
         account = get_or_create_account(
-            message.chat.id,
+            workspace_id(message),
             account_name,
             currency,
             "safe" if account_name == "Сейф" else "other",
@@ -293,7 +313,7 @@ def insert_paired_operations(message, first: dict, second: dict):
     common = {
         "operation_date": today_str(),
         "operation_group": group_id,
-        "telegram_chat_id": message.chat.id,
+        "telegram_chat_id": workspace_id(message),
         "telegram_message_id": message.message_id,
         "is_cancelled": False,
         **user_fields(message),
@@ -301,7 +321,7 @@ def insert_paired_operations(message, first: dict, second: dict):
     payloads = []
     for item in (first, second):
         account = get_or_create_account(
-            message.chat.id,
+            workspace_id(message),
             item["account_name"],
             item["currency"],
             item.get("account_type", "other"),
@@ -337,7 +357,7 @@ def handle_transfer(message, text: str) -> bool:
     source_match = re.search(r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|$)", before, flags=re.IGNORECASE)
     destination_match = re.search(r"(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
 
-    # Common phrasing: "з картки Миколи зняли 10000 грн і поклали в загальну касу"
+    # Common phrasing: "з картки Миколи зняли 10000 грн і поклали в фастівську касу"
     if not source_match:
         source_match = re.search(
             r"(?:з|із|зі|від)\s+(.+?)(?:\s+(?:в|у|на|до)\s+|\s+зняли|\s+переклали|\s+переказали|$)",
@@ -505,6 +525,166 @@ def handle_natural_expense(message, text: str) -> bool:
     return True
 
 
+
+# ------------------------ Evening cash intake ------------------------
+
+AMOUNT_TOKEN_RE = re.compile(
+    r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
+    r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
+    flags=re.IGNORECASE,
+)
+
+
+def parse_all_amounts(text: str):
+    return [
+        (parse_amount(m.group("amount")), parse_currency(m.group("currency")))
+        for m in AMOUNT_TOKEN_RE.finditer(text)
+    ]
+
+
+def handle_evening_cash(message, text: str) -> bool:
+    """Record Fastivska and optional Bazaar daily amounts into the main cash ledger."""
+    low = text.lower()
+    has_fastivska = any(x in low for x in ("фастівська", "фастовська", "фастівка"))
+    has_bazaar = "базар" in low
+    if not (has_fastivska or has_bazaar):
+        return False
+
+    # This handler is only for the concise evening format, not ordinary prose.
+    if not re.search(r"\d", text):
+        return False
+
+    normalized = text.replace(";", "\n")
+    # Split where the second source begins, while keeping the source word.
+    chunks = re.split(r"\n|,(?=\s*(?:базар|фаст))", normalized, flags=re.IGNORECASE)
+    entries = []
+    for chunk in chunks:
+        chunk = normalize_text(chunk)
+        if not chunk:
+            continue
+        chunk_low = chunk.lower()
+        source = None
+        if "базар" in chunk_low:
+            source = "Базар"
+        elif any(x in chunk_low for x in ("фастівська", "фастовська", "фастівка")):
+            source = "Фастівська"
+        if not source:
+            continue
+        for amount, currency in parse_all_amounts(chunk):
+            entries.append((source, amount, currency))
+
+    if not entries:
+        return False
+
+    # Bazaar is only a daily sales indicator and is immediately included in main cash.
+    # It is not created as a separate balance account.
+    for source, amount, currency in entries:
+        sb_insert(
+            "cash_operations",
+            operation_payload(
+                message,
+                "income",
+                amount,
+                currency,
+                f"Денна каса | {source}",
+                account_name="Фастівська каса",
+            ),
+        )
+
+    totals = {}
+    for _, amount, currency in entries:
+        totals[currency] = totals.get(currency, Decimal("0")) + amount
+
+    lines = ["✅ <b>Касу за день записано</b>", ""]
+    for source in ("Фастівська", "Базар"):
+        source_rows = [(a, c) for s0, a, c in entries if s0 == source]
+        if source_rows:
+            lines.append(f"{source}:")
+            for amount, currency in source_rows:
+                lines.append(f"• {money(amount, currency)}")
+    lines.append("\nДодано у <b>Фастівську касу</b>:")
+    for currency in ("UAH", "USD", "EUR"):
+        if currency in totals:
+            lines.append(f"• {money(totals[currency], currency)}")
+    bot.reply_to(message, "\n".join(lines))
+    return True
+
+
+# ------------------------ OpenAI natural-language parser ------------------------
+
+def ai_normalize_command(text: str) -> str | None:
+    if not OPENAI_API_KEY:
+        return None
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "understood": {"type": "boolean"},
+            "canonical_command": {"type": "string"},
+        },
+        "required": ["understood", "canonical_command"],
+    }
+    instructions = """
+You normalize Ukrainian/Russian bookkeeping messages for DvirFinance.
+Return one canonical command only; never invent amounts, names, currencies, accounts, or dates.
+Supported canonical forms:
+- фастівська 25000 грн, базар 3000 грн
+- виручка 25000 грн опис
+- витрата 1200 грн опис
+- з картки Миколи оплатили 1200 грн опис
+- переклали 10000 грн з картки Миколи в фастівську касу
+- поміняли 100000 грн на долари по курсу 41,80
+- орендар Вася 12000 грн оренда
+- борг Bolena 5000 грн опис
+- Bolena оплатила 3000 грн у фастівську касу
+- ревізія 125000 грн у фастівській касі
+- каса / борги / орендарі / платежі Ім'я / історія / видалити останню
+Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
+All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
+Bazaar is never a separate balance: its amount is daily sales added to Fastivska cash.
+If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
+""".strip()
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": text,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "finance_command",
+                "strict": True,
+                "schema": schema,
+            }
+        },
+    }
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=35,
+        )
+        response.raise_for_status()
+        data = response.json()
+        output_text = data.get("output_text")
+        if not output_text:
+            # Defensive extraction for SDK-independent HTTP use.
+            for item in data.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text":
+                        output_text = content.get("text")
+                        break
+        parsed = json.loads(output_text or "{}")
+        command = normalize_text(parsed.get("canonical_command") or "")
+        return command if parsed.get("understood") and command else None
+    except Exception:
+        log.exception("OpenAI parser failed")
+        return None
+
 # ------------------------ Revisions ------------------------
 
 def handle_revision(message, text: str) -> bool:
@@ -514,13 +694,13 @@ def handle_revision(message, text: str) -> bool:
     amount, currency, match = extract_amount_currency(text)
     tail = normalize_text(text[match.end():])
     account_name, account_type = default_account_name(tail, currency)
-    account = get_or_create_account(message.chat.id, account_name, currency, account_type)
+    account = get_or_create_account(workspace_id(message), account_name, currency, account_type)
 
     previous = sb_select(
         "cash_revisions",
         {
             "select": "*",
-            "telegram_chat_id": f"eq.{message.chat.id}",
+            "telegram_chat_id": f"eq.{workspace_id(message)}",
             "account_id": f"eq.{account['id']}",
             "currency": f"eq.{currency}",
             "order": "revision_date.desc,created_at.desc",
@@ -533,7 +713,7 @@ def handle_revision(message, text: str) -> bool:
         "cash_revisions",
         {
             "revision_date": today_str(),
-            "telegram_chat_id": message.chat.id,
+            "telegram_chat_id": workspace_id(message),
             "account_id": account["id"],
             "account_name": account_name,
             "currency": currency,
@@ -563,7 +743,7 @@ def handle_revision(message, text: str) -> bool:
 def create_debt(message, customer_name: str, amount: Decimal, currency: str, description: str):
     payload = {
         "debt_date": today_str(),
-        "telegram_chat_id": message.chat.id,
+        "telegram_chat_id": workspace_id(message),
         "customer_name": normalize_text(customer_name),
         "description": description or None,
         "currency": currency,
@@ -645,14 +825,14 @@ def handle_debt_queries(message, text: str) -> bool:
     low = text.lower().strip()
 
     if low in ("борги", "хто нам винен", "хто винен"):
-        bot.reply_to(message, debt_list_text(find_open_debts(message.chat.id)))
+        bot.reply_to(message, debt_list_text(find_open_debts(workspace_id(message))))
         return True
 
     if low.startswith("борг ") and not re.search(r"\d", text):
         customer = normalize_text(text[5:])
         bot.reply_to(
             message,
-            debt_list_text(find_open_debts(message.chat.id, customer)),
+            debt_list_text(find_open_debts(workspace_id(message), customer)),
         )
         return True
 
@@ -679,7 +859,7 @@ def handle_debt_payment(message, text: str) -> bool:
     except ValueError:
         return False
 
-    debts = find_open_debts(message.chat.id, customer)
+    debts = find_open_debts(workspace_id(message), customer)
     debts = [d for d in debts if d["currency"] == currency]
     if not debts:
         bot.reply_to(
@@ -702,7 +882,7 @@ def handle_debt_payment(message, text: str) -> bool:
 
     destination_text = normalize_text(tail[match.end():])
     account_name, account_type = default_account_name(destination_text)
-    account = get_or_create_account(message.chat.id, account_name, currency, account_type)
+    account = get_or_create_account(workspace_id(message), account_name, currency, account_type)
 
     remaining_payment = amount
     affected = []
@@ -721,7 +901,7 @@ def handle_debt_payment(message, text: str) -> bool:
             "debt_payments",
             {
                 "payment_date": today_str(),
-                "telegram_chat_id": message.chat.id,
+                "telegram_chat_id": workspace_id(message),
                 "debt_id": debt["id"],
                 "amount": float(part),
                 "currency": currency,
@@ -783,7 +963,7 @@ def handle_tenant_payment(message, text: str) -> bool:
         return True
 
     category = tenant_category(details)
-    account_name = "Загальна каса"
+    account_name = "Фастівська каса"
     description = f"Орендар: {tenant_name} | {category}"
     if details:
         description += f" | {details}"
@@ -852,14 +1032,14 @@ def tenant_payments_text(chat_id: int, tenant_query: str | None = None) -> str:
 def handle_tenant_queries(message, text: str) -> bool:
     low = text.lower().strip()
     if low in ("орендарі", "арендатори", "платежі орендарів", "оплати орендарів"):
-        bot.reply_to(message, tenant_payments_text(message.chat.id))
+        bot.reply_to(message, tenant_payments_text(workspace_id(message)))
         return True
 
     for prefix in ("платежі ", "оплати "):
         if low.startswith(prefix):
             name = normalize_text(text[len(prefix):])
             if name:
-                bot.reply_to(message, tenant_payments_text(message.chat.id, name))
+                bot.reply_to(message, tenant_payments_text(workspace_id(message), name))
                 return True
     return False
 
@@ -939,7 +1119,7 @@ def handle_daily_closing(message, text: str) -> bool:
         "daily_closings",
         {
             "select": "id",
-            "telegram_chat_id": f"eq.{message.chat.id}",
+            "telegram_chat_id": f"eq.{workspace_id(message)}",
             "closing_date": f"eq.{today_str()}",
             "currency": f"eq.{currency}",
             "is_cancelled": "eq.false",
@@ -961,7 +1141,7 @@ def handle_daily_closing(message, text: str) -> bool:
         "daily_closings",
         {
             "closing_date": today_str(),
-            "telegram_chat_id": message.chat.id,
+            "telegram_chat_id": workspace_id(message),
             "currency": currency,
             "total_revenue": float(total),
             "cash_to_safe": float(safe_total),
@@ -975,7 +1155,7 @@ def handle_daily_closing(message, text: str) -> bool:
     )[0]
 
     for name, account_type, amount in allocations:
-        account = get_or_create_account(message.chat.id, name, currency, account_type)
+        account = get_or_create_account(workspace_id(message), name, currency, account_type)
         sb_insert(
             "daily_closing_accounts",
             {
@@ -1100,7 +1280,7 @@ def cash_summary(chat_id: int) -> str:
         },
     )
     for row in payments:
-        key = (row.get("destination_account_name") or "Сейф", row["currency"])
+        key = (display_account_name(row.get("destination_account_name") or "Фастівська каса"), row["currency"])
         rev_date = revision_dates.get(key)
         if rev_date and row["payment_date"] <= rev_date:
             continue
@@ -1132,7 +1312,7 @@ def cash_summary(chat_id: int) -> str:
             tenant_names.add(first.casefold())
 
     lines = ["💰 <b>Фінансовий стан</b>"]
-    account_order = ["Загальна каса", "Картка Миколи", "Картка Андрія"]
+    account_order = ["Фастівська каса", "Картка Миколи", "Картка Андрія"]
     currency_order = {"UAH": 0, "USD": 1, "EUR": 2}
 
     if balances:
@@ -1144,7 +1324,7 @@ def cash_summary(chat_id: int) -> str:
             ]
             if not account_rows:
                 continue
-            icon = "💵" if account == "Загальна каса" else "💳"
+            icon = "💵" if account == "Фастівська каса" else "💳"
             lines.append(f"\n{icon} <b>{account}</b>")
             for curr, amount in sorted(account_rows, key=lambda item: currency_order.get(item[0], 99)):
                 lines.append(money(amount, curr))
@@ -1249,19 +1429,19 @@ def history_text(chat_id: int):
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v2.3</b>
+<b>Dvir Finance v3.0 AI</b>
 
 Основні команди:
 
-<code>ревізія 125000 грн у загальній касі</code>
-<code>ревізія 1557 доларів у загальній касі</code>
-<code>ревізія 305 євро у загальній касі</code>
+<code>ревізія 125000 грн у фастівській касі</code>
+<code>ревізія 1557 доларів у фастівській касі</code>
+<code>ревізія 305 євро у фастівській касі</code>
 
 <code>виручка 25000 грн</code>
 <code>витрата 1200 грн бензин</code>
 <code>з картки Миколи оплатили 15000 грн за товар</code>
 
-<code>переклали 10000 грн з картки Миколи в загальну касу</code>
+<code>переклали 10000 грн з картки Миколи в фастівську касу</code>
 <code>поміняли 100000 грн на долари по курсу 41,80</code>
 <code>поміняли 5000 доларів на євро по курсу 0,91</code>
 
@@ -1272,15 +1452,15 @@ HELP_TEXT = """
 <code>платежі Вася</code>
 
 <code>борг Bolena 5000 грн полікарбонат</code>
-<code>Bolena оплатила 3000 грн у загальну касу</code>
+<code>Bolena оплатила 3000 грн у фастівську касу</code>
 <code>борги</code>
 <code>борг Bolena</code>
 
-Закриття дня одним повідомленням:
-<code>виручка за день 48000 грн
-у загальну касу 35000 грн
-на картку Миколи 8000 грн
-борг Bolena 5000 грн</code>
+Вечірня каса одним повідомленням:
+<code>фастівська 25000 грн, базар 3000 грн</code>
+<code>фастівська 25000 грн 500 доларів 200 євро</code>
+
+Базар — лише денний продаж. Його сума одразу додається у Фастівську касу.
 
 <code>каса</code>
 <code>звіт</code>
@@ -1299,35 +1479,41 @@ def start_handler(message):
 def id_handler(message):
     bot.reply_to(
         message,
-        f"ID групи/чату: <code>{message.chat.id}</code>\n"
+        f"ID групи/чату: <code>{workspace_id(message)}</code>\n"
         f"Ваш Telegram ID: <code>{message.from_user.id}</code>",
     )
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def text_handler(message):
-    text = message.text.strip()
-    low = text.lower()
+    if not is_authorized(message):
+        bot.reply_to(message, "⛔ Цей користувач не має доступу до спільної каси.")
+        return
+    dispatch_text(message, message.text.strip(), allow_ai=True)
+
+
+def dispatch_text(message, text: str, allow_ai: bool = True):
+    low = text.lower().strip()
 
     try:
-        if low in ("каса", "баланс", "скільки грошей", "яка загальна каса", "скільки всього грошей", "що маємо зараз"):
-            bot.reply_to(message, cash_summary(message.chat.id))
+        if low in ("каса", "баланс", "скільки грошей", "яка фастівська каса", "скільки всього грошей", "що маємо зараз"):
+            bot.reply_to(message, cash_summary(workspace_id(message)))
             return
 
         if low in ("звіт", "отчет"):
-            bot.reply_to(message, report_text(message.chat.id))
+            bot.reply_to(message, report_text(workspace_id(message)))
             return
 
         if low in ("історія", "история"):
-            bot.reply_to(message, history_text(message.chat.id))
+            bot.reply_to(message, history_text(workspace_id(message)))
             return
 
-        if low in ("видалити останню", "удалить последнюю"):
+        if low in ("видалити останню", "удалить последнюю", "скасувати останню"):
             rows = sb_select(
                 "cash_operations",
                 {
                     "select": "*",
-                    "telegram_chat_id": f"eq.{message.chat.id}",
+                    "telegram_chat_id": f"eq.{workspace_id(message)}",
                     "is_cancelled": "eq.false",
                     "order": "created_at.desc",
                     "limit": "1",
@@ -1348,11 +1534,12 @@ def text_handler(message):
             )
             bot.reply_to(
                 message,
-                f"✅ Останню операцію скасовано: "
-                f"{money(row['amount'], row['currency'])}",
+                f"✅ Останню операцію скасовано: {money(row['amount'], row['currency'])}",
             )
             return
 
+        if handle_evening_cash(message, text):
+            return
         if handle_exchange(message, text):
             return
         if handle_transfer(message, text):
@@ -1376,24 +1563,33 @@ def text_handler(message):
         if handle_income_expense(message, text):
             return
 
+        if allow_ai:
+            canonical = ai_normalize_command(text)
+            if canonical and canonical.casefold() != normalize_text(text).casefold():
+                log.info("AI normalized: %r -> %r", text, canonical)
+                dispatch_text(message, canonical, allow_ai=False)
+                return
+
         bot.reply_to(
             message,
-            "Не зовсім зрозумів запис.\n\nНатисни /help або напиши, наприклад:\n"
-            "<code>витрата 1200 грн бензин</code>",
+            "Не зовсім зрозумів запис. Дані не записував.\n\n"
+            "Напиши, наприклад:\n"
+            "<code>фастівська 25000 грн, базар 3000 грн</code>\n"
+            "або натисни /help",
         )
 
     except Exception as exc:
         log.exception("Помилка обробки повідомлення")
         bot.reply_to(
             message,
-            "⚠️ Не вдалося записати операцію. "
-            "Дані не втрачено. Спробуй ще раз або надішли скрін помилки.\n\n"
+            "⚠️ Не вдалося записати операцію. Дані не втрачено. "
+            "Спробуй ще раз або надішли скрін помилки.\n\n"
             f"<code>{str(exc)[:300]}</code>",
         )
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v2.3 запущено")
+    log.info("Dvir Finance Bot v4.0 AI запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
