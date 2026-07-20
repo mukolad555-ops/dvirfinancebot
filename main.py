@@ -10,7 +10,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v2.2
+# Dvir Finance Bot v2.3
 # Telegram + Supabase
 # ============================================================
 
@@ -176,35 +176,30 @@ def get_or_create_account(chat_id: int, account_name: str, currency: str, accoun
 
 
 def account_from_text(text: str, currency: str = "UAH") -> tuple[str, str]:
-    """Recognize the money location named by the user."""
+    """Recognize one of the three simple money locations used by the business."""
     low = text.lower()
 
     if "микол" in low and "карт" in low:
         return "Картка Миколи", "personal_card"
     if "андр" in low and "карт" in low:
         return "Картка Андрія", "personal_card"
-    if "фоп" in low and "карт" in low:
-        return "ФОП-картка", "fop_card"
 
-    card_match = re.search(
-        r"карт(?:ка|ку|ці|ки|кою)\s+([а-яіїєґa-z'’-]+)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if card_match:
-        owner = normalize_text(card_match.group(1)).capitalize()
-        return f"Картка {owner}", "personal_card"
+    # All cash currencies live in one logical account: Загальна каса.
+    # Currency remains a separate field, so UAH, USD and EUR never mix.
+    return "Загальна каса", "cash"
 
-    if currency == "USD" or "доларов" in low or "долларов" in low:
-        return "Доларова каса", "currency_cash"
-    if currency == "EUR" or "євров" in low or "евров" in low:
-        return "Євро каса", "currency_cash"
 
-    if any(word in low for word in ("загальн", "сейф", "готів", "налич", "каса")):
-        return "Загальна каса", "safe"
-
-    return "Загальна каса", "safe"
-
+def display_account_name(account_name: str | None) -> str:
+    """Merge old account names into the new compact three-account view."""
+    name = normalize_text(account_name or "Загальна каса")
+    low = name.lower()
+    if "микол" in low and "карт" in low:
+        return "Картка Миколи"
+    if "андр" in low and "карт" in low:
+        return "Картка Андрія"
+    # Legacy names such as Сейф, Доларова каса and Євро каса are displayed
+    # inside one Загальна каса, while their currencies stay separate.
+    return "Загальна каса"
 
 def default_account_name(text: str, currency: str = "UAH") -> tuple[str, str]:
     return account_from_text(text, currency)
@@ -1031,14 +1026,19 @@ def cash_summary(chat_id: int) -> str:
     balances = {}
 
     def add(account_name, currency, amount):
-        key = (account_name or "Сейф", currency)
+        key = (display_account_name(account_name), currency)
         balances[key] = balances.get(key, Decimal("0")) + Decimal(str(amount or 0))
 
     revisions = latest_revisions(chat_id)
     revision_dates = {}
-    for key, row in revisions.items():
-        balances[key] = Decimal(str(row["actual_amount"]))
-        revision_dates[key] = row["revision_date"]
+    # Several old names may now point to the same logical account. Keep only
+    # the newest revision for each displayed account and currency.
+    for old_key, row in revisions.items():
+        key = (display_account_name(old_key[0]), old_key[1])
+        previous_date = revision_dates.get(key)
+        if previous_date is None or row["revision_date"] > previous_date:
+            balances[key] = Decimal(str(row["actual_amount"]))
+            revision_dates[key] = row["revision_date"]
 
     operations = sb_select(
         "cash_operations",
@@ -1050,7 +1050,7 @@ def cash_summary(chat_id: int) -> str:
         },
     )
     for row in operations:
-        key = (row.get("account_name") or "Сейф", row["currency"])
+        key = (display_account_name(row.get("account_name")), row["currency"])
         rev_date = revision_dates.get(key)
         if rev_date and row["operation_date"] <= rev_date:
             continue
@@ -1114,13 +1114,45 @@ def cash_summary(chat_id: int) -> str:
             str(debt["outstanding_amount"])
         )
 
-    lines = ["💰 <b>Фінансовий стан</b>\n"]
+    tenant_rows = sb_select(
+        "cash_operations",
+        {
+            "select": "description",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "operation_type": "eq.income",
+            "description": "like.Орендар:*",
+            "is_cancelled": "eq.false",
+        },
+    )
+    tenant_names = set()
+    for row in tenant_rows:
+        desc = row.get("description") or ""
+        first = desc.split("|", 1)[0].replace("Орендар:", "").strip()
+        if first:
+            tenant_names.add(first.casefold())
+
+    lines = ["💰 <b>Фінансовий стан</b>"]
+    account_order = ["Загальна каса", "Картка Миколи", "Картка Андрія"]
+    currency_order = {"UAH": 0, "USD": 1, "EUR": 2}
+
     if balances:
-        lines.append("<b>Доступні гроші:</b>")
-        for (name, curr), amount in sorted(balances.items()):
-            lines.append(f"• {name}: {money(amount, curr)}")
+        for account in account_order:
+            account_rows = [
+                (curr, amount)
+                for (name, curr), amount in balances.items()
+                if name == account and amount != 0
+            ]
+            if not account_rows:
+                continue
+            icon = "💵" if account == "Загальна каса" else "💳"
+            lines.append(f"\n{icon} <b>{account}</b>")
+            for curr, amount in sorted(account_rows, key=lambda item: currency_order.get(item[0], 99)):
+                lines.append(money(amount, curr))
     else:
-        lines.append("Грошові залишки ще не внесені.")
+        lines.append("\nГрошові залишки ще не внесені.")
+
+    lines.append("\n🏢 <b>Орендарі</b>")
+    lines.append(f"{len(tenant_names)} орендарів із зафіксованими платежами" if tenant_names else "Платежів ще немає")
 
     lines.append("\n<b>Нам винні:</b>")
     if debt_totals:
@@ -1217,11 +1249,13 @@ def history_text(chat_id: int):
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v2.2</b>
+<b>Dvir Finance v2.3</b>
 
 Основні команди:
 
-<code>ревізія 125000 грн у сейфі</code>
+<code>ревізія 125000 грн у загальній касі</code>
+<code>ревізія 1557 доларів у загальній касі</code>
+<code>ревізія 305 євро у загальній касі</code>
 
 <code>виручка 25000 грн</code>
 <code>витрата 1200 грн бензин</code>
@@ -1238,13 +1272,13 @@ HELP_TEXT = """
 <code>платежі Вася</code>
 
 <code>борг Bolena 5000 грн полікарбонат</code>
-<code>Bolena оплатила 3000 грн у сейф</code>
+<code>Bolena оплатила 3000 грн у загальну касу</code>
 <code>борги</code>
 <code>борг Bolena</code>
 
 Закриття дня одним повідомленням:
 <code>виручка за день 48000 грн
-у сейф 35000 грн
+у загальну касу 35000 грн
 на картку Миколи 8000 грн
 борг Bolena 5000 грн</code>
 
@@ -1359,7 +1393,7 @@ def text_handler(message):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v2.2 запущено")
+    log.info("Dvir Finance Bot v2.3 запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
