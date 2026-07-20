@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v4.4 AI FINAL
+# Dvir Finance Bot v5.0 STABLE
 # Telegram + Supabase
 # ============================================================
 
@@ -50,7 +50,7 @@ HEADERS = {
 }
 
 CURRENCY_ALIASES = {
-    "грн": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
+    "грн": "UAH", "гр": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
     "гривні": "UAH", "гривня": "UAH",
     "дол": "USD", "долар": "USD", "долари": "USD", "доларів": "USD",
     "usd": "USD", "$": "USD",
@@ -154,7 +154,7 @@ def money(value, currency: str) -> str:
 def extract_amount_currency(text: str):
     pattern = (
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?"
     )
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -424,7 +424,7 @@ def handle_exchange(message, text: str) -> bool:
     amounts = []
     pattern = re.compile(
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
+        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
         flags=re.IGNORECASE,
     )
     for m in pattern.finditer(text):
@@ -530,7 +530,7 @@ def handle_natural_expense(message, text: str) -> bool:
 
 AMOUNT_TOKEN_RE = re.compile(
     r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-    r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
+    r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
     flags=re.IGNORECASE,
 )
 
@@ -543,31 +543,73 @@ def parse_all_amounts(text: str):
 
 
 def handle_evening_cash(message, text: str) -> bool:
-    """Record main cash and optional Bazaar daily amounts into the main cash ledger."""
-    low = text.lower()
+    """Record multi-currency daily revenue and optional Bazaar sales.
+
+    Supported examples:
+    - виручка 27000 грн 1200 $
+    - виручка каса 6000 грн 1400 $
+    - виручка склад 3000 грн, 100 євро, 27 доларів
+    - виручка каса 25000 грн 300 $ 150 € базар 3000 грн
+
+    If the message starts with "виручка" and no source marker is written,
+    every amount belongs to the main Cash account. Bazaar is only a source
+    label; its amounts are also added to the same Cash balance.
+    """
+    low = text.lower().strip()
+    is_revenue = low.startswith(("виручка", "дохід", "доход", "прихід", "приход"))
+
     source_pattern = re.compile(
-        r"(?:базар(?:[-\s]*каса)?|на\s+базарі|фастівськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастовськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастівка|(?:(?:загальна|основна)\s+)?кас(?:а|і|у))",
+        r"(?:базар(?:[-\s]*каса)?|на\s+базарі|(?:виручка\s+)?склад(?:у|і|ом)?|на\s+складі|зі\s+складу|фастівськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастовськ(?:а|ій|ої)?(?:\s+каса|\s+касі|\s+касу)?|фастівка|(?:(?:загальна|основна)\s+)?кас(?:а|і|у))",
         flags=re.IGNORECASE,
     )
     markers = list(source_pattern.finditer(text))
-    if not markers or not re.search(r"\d", text):
+
+    # This handler is only for explicit cash/source messages or any
+    # multi-currency revenue message. It must not steal ordinary expenses,
+    # transfers, debts, or tenant commands.
+    if not markers and not is_revenue:
+        return False
+    if not re.search(r"\d", text):
         return False
 
     entries = []
-    for i, marker in enumerate(markers):
-        marker_text = marker.group(0).lower()
-        source = "Базар" if "базар" in marker_text else "Каса"
-        segment_start = marker.end()
-        segment_end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
-        segment = text[segment_start:segment_end]
-        for amount, currency in parse_all_amounts(segment):
-            entries.append((source, amount, currency))
+
+    if markers:
+        # Amounts before the first marker (usually immediately after the word
+        # "виручка") belong to Cash, so short natural phrases are not lost.
+        prefix_start = 0
+        if is_revenue:
+            revenue_word = re.match(r"\s*(?:виручка|дохід|доход|прихід|приход)\b", text, re.IGNORECASE)
+            prefix_start = revenue_word.end() if revenue_word else 0
+        prefix = text[prefix_start:markers[0].start()]
+        for amount, currency in parse_all_amounts(prefix):
+            entries.append(("Каса", amount, currency))
+
+        for i, marker in enumerate(markers):
+            marker_text = marker.group(0).lower()
+            source = "Базар" if "базар" in marker_text else "Каса"
+            segment_start = marker.end()
+            segment_end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            segment = text[segment_start:segment_end]
+            for amount, currency in parse_all_amounts(segment):
+                entries.append((source, amount, currency))
+    else:
+        # "виручка 27000 грн 1200 $ 100 €" — all currencies are Cash.
+        revenue_body = re.sub(
+            r"^\s*(?:виручка|дохід|доход|прихід|приход)\b[:\s-]*",
+            "",
+            text,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        for amount, currency in parse_all_amounts(revenue_body):
+            entries.append(("Каса", amount, currency))
 
     if not entries:
         return False
 
-    # Bazaar is only a daily sales indicator. Its amount is added immediately
-    # to the main cash balance and is never kept as a separate balance.
+    # Bazaar is a daily sales source, not a separate balance. Every recognized
+    # amount is inserted exactly once into the main Cash account.
     for source, amount, currency in entries:
         sb_insert(
             "cash_operations",
@@ -631,7 +673,7 @@ Supported canonical forms:
 - борг Bolena 5000 грн опис
 - Bolena оплатила 3000 грн у касу
 - ревізія 125000 грн у касі
-- каса / борги / орендарі / платежі Ім'я / історія / видалити останню
+- каса / баланс / сьогодні / борги / орендарі / платежі Ім'я / історія / відміна
 Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
 All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
 Bazaar is never a separate balance: its amount is daily sales added immediately to the single general cash account named Каса.
@@ -1409,10 +1451,76 @@ def history_text(chat_id: int):
     return "\n".join(lines)
 
 
+
+def cancel_last_logical_operation(message) -> bool:
+    """Cancel the newest logical cash action, not just one database row.
+
+    Transfers and exchanges use operation_group. Multi-currency revenue entered
+    in one Telegram message shares telegram_message_id. In both cases every
+    related row is cancelled together so balances remain correct.
+    """
+    chat_id = workspace_id(message)
+    rows = sb_select(
+        "cash_operations",
+        {
+            "select": "*",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
+            "order": "created_at.desc",
+            "limit": "1",
+        },
+    )
+    if not rows:
+        bot.reply_to(message, "Немає операції для відміни.")
+        return True
+
+    last = rows[0]
+    if last.get("operation_group"):
+        params = {
+            "telegram_chat_id": f"eq.{chat_id}",
+            "operation_group": f"eq.{last['operation_group']}",
+            "is_cancelled": "eq.false",
+        }
+    elif last.get("telegram_message_id") is not None:
+        params = {
+            "telegram_chat_id": f"eq.{chat_id}",
+            "telegram_message_id": f"eq.{last['telegram_message_id']}",
+            "is_cancelled": "eq.false",
+        }
+    else:
+        params = {"id": f"eq.{last['id']}"}
+
+    related = sb_select("cash_operations", {"select": "*", **params})
+    now = datetime.now(KYIV).isoformat()
+    sb_update(
+        "cash_operations",
+        params,
+        {
+            "is_cancelled": True,
+            "cancelled_at": now,
+            "cancellation_reason": f"Відмінено користувачем {message.from_user.id}",
+        },
+    )
+
+    totals = {}
+    for row in related or [last]:
+        sign = Decimal("-1") if row.get("operation_type") in ("expense", "exchange_out", "transfer_out") else Decimal("1")
+        curr = row.get("currency", "UAH")
+        totals[curr] = totals.get(curr, Decimal("0")) + sign * Decimal(str(row.get("amount") or 0))
+
+    lines = ["✅ <b>Останню операцію відмінено</b>"]
+    for curr in ("UAH", "USD", "EUR"):
+        if curr in totals:
+            lines.append(f"• {money(abs(totals[curr]), curr)}")
+    if len(related) > 1:
+        lines.append(f"Пов'язаних записів: {len(related)}")
+    bot.reply_to(message, "\n".join(lines))
+    return True
+
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v4.3 AI — остаточна версія</b>
+<b>Dvir Finance v5.0 Stable</b>
 
 Основні команди:
 
@@ -1445,10 +1553,10 @@ HELP_TEXT = """
 
 Базар — лише денний продаж. Його сума одразу додається у загальну касу.
 
-<code>каса</code>
-<code>звіт</code>
+<code>каса</code> або <code>баланс</code>
+<code>сьогодні</code> або <code>звіт</code>
 <code>історія</code>
-<code>видалити останню</code>
+<code>відміна</code> — відмінити останню логічну операцію
 <code>/id</code>
 """.strip()
 
@@ -1483,7 +1591,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, cash_summary(workspace_id(message)))
             return
 
-        if low in ("звіт", "отчет"):
+        if low in ("звіт", "отчет", "сьогодні", "сегодня"):
             bot.reply_to(message, report_text(workspace_id(message)))
             return
 
@@ -1491,34 +1599,22 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, history_text(workspace_id(message)))
             return
 
-        if low in ("видалити останню", "удалить последнюю", "скасувати останню"):
-            rows = sb_select(
-                "cash_operations",
-                {
-                    "select": "*",
-                    "telegram_chat_id": f"eq.{workspace_id(message)}",
-                    "is_cancelled": "eq.false",
-                    "order": "created_at.desc",
-                    "limit": "1",
-                },
-            )
-            if not rows:
-                bot.reply_to(message, "Немає операції для видалення.")
-                return
-            row = rows[0]
-            sb_update(
-                "cash_operations",
-                {"id": f"eq.{row['id']}"},
-                {
-                    "is_cancelled": True,
-                    "cancelled_at": datetime.now(KYIV).isoformat(),
-                    "cancellation_reason": f"Скасовано користувачем {message.from_user.id}",
-                },
-            )
-            bot.reply_to(
-                message,
-                f"✅ Останню операцію скасовано: {money(row['amount'], row['currency'])}",
-            )
+        if low in ("відміна", "відмінити", "скасувати останню", "видалити останню", "отмена", "отміна"):
+            cancel_last_logical_operation(message)
+            return
+
+        one_word_hints = {
+            "ревізія": "Напиши фактичний залишок, наприклад:\n<code>ревізія 125000 грн 1200 $ 300 € у касі</code>",
+            "ревизия": "Напиши фактичний залишок, наприклад:\n<code>ревізія 125000 грн у касі</code>",
+            "виручка": "Додай суму, наприклад:\n<code>виручка 27000 грн 1200 $ 100 €</code>",
+            "витрата": "Додай суму й опис, наприклад:\n<code>витрата 2500 грн пальне</code>",
+            "видаток": "Додай суму й опис, наприклад:\n<code>видаток 2500 грн пальне</code>",
+            "обмін": "Напиши обидві валюти та курс, наприклад:\n<code>поміняли 100000 грн на долари по курсу 41,80</code>",
+            "борг": "Напиши ім’я, суму й опис, наприклад:\n<code>борг Bolena 5000 грн товар</code>",
+            "орендар": "Напиши ім’я, суму й тип платежу, наприклад:\n<code>орендар Вася 12000 грн оренда</code>",
+        }
+        if low in one_word_hints:
+            bot.reply_to(message, one_word_hints[low])
             return
 
         if handle_evening_cash(message, text):
@@ -1572,7 +1668,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v4.4 AI FINAL запущено")
+    log.info("Dvir Finance Bot v5.0 STABLE запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
