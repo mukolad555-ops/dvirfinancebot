@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v5.2 CARD DIRECTIONS
+# Dvir Finance Bot v5.3 TENANT TO CASH
 # Telegram + Supabase
 # ============================================================
 
@@ -740,7 +740,7 @@ def handle_evening_cash(message, text: str) -> bool:
 
         for i, marker in enumerate(markers):
             marker_text = marker.group(0).lower()
-            source = "Базар" if "базар" in marker_text else "Каса"
+            source = "Базар" if "базар" in marker_text else ("Склад" if "склад" in marker_text else "Каса")
             segment_start = marker.end()
             segment_end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
             segment = text[segment_start:segment_end]
@@ -761,8 +761,9 @@ def handle_evening_cash(message, text: str) -> bool:
     if not entries:
         return False
 
-    # Bazaar is a daily sales source, not a separate balance. Every recognized
-    # amount is inserted exactly once into the main Cash account.
+    # Warehouse and Bazaar are two separate revenue branches, not separate balance accounts.
+    # Every recognized amount is inserted exactly once into the main Cash account,
+    # while the description preserves whether the money came from Склад or Базар.
     for source, amount, currency in entries:
         sb_insert(
             "cash_operations",
@@ -781,7 +782,7 @@ def handle_evening_cash(message, text: str) -> bool:
         totals[currency] = totals.get(currency, Decimal("0")) + amount
 
     lines = ["✅ <b>Касу за день записано</b>", ""]
-    for source in ("Каса", "Базар"):
+    for source in ("Склад", "Базар", "Каса"):
         source_rows = [(a, c) for s0, a, c in entries if s0 == source]
         if source_rows:
             lines.append(f"<b>{source}</b>")
@@ -816,7 +817,7 @@ def ai_normalize_command(text: str) -> str | None:
 You normalize Ukrainian/Russian bookkeeping messages for DvirFinance.
 Return one canonical command only; never invent amounts, names, currencies, accounts, or dates.
 Supported canonical forms:
-- каса 25000 грн, 300 $, 150 €, базар 3000 грн
+- виручка склад 25000 грн, 300 $, 150 €, базар 3000 грн
 - виручка 25000 грн опис
 - витрата 1200 грн опис
 - з картки Миколи оплатили 1200 грн опис
@@ -832,7 +833,7 @@ Supported canonical forms:
 - каса / баланс / сьогодні / борги / орендарі / платежі Ім'я / історія / відміна
 Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
 All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
-Bazaar is never a separate balance: its amount is daily sales added immediately to the single general cash account named Каса.
+Склад and Базар are two separate revenue sources. They must be preserved as distinct source labels in reports, but both amounts are added immediately to the single general cash account named Каса.
 Incoming money to Andrii/Mykola is income, never an expense. Preserve the exact destination account: ПриватБанк, ФОП, Банк Південний, or generic картка. If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
 """.strip()
     payload = {
@@ -1139,14 +1140,26 @@ def tenant_category(text: str) -> str:
 
 def handle_tenant_payment(message, text: str) -> bool:
     low = text.lower().strip()
-    if not low.startswith(("орендар ", "арендатор ")):
+    prefixes = ("орендар ", "орендарка ", "арендатор ", "арендаторка ")
+    prefix = next((item for item in prefixes if low.startswith(item)), None)
+    if not prefix:
         return False
 
-    prefix_len = len("орендар ") if low.startswith("орендар ") else len("арендатор ")
-    rest = text[prefix_len:].strip()
+    rest = text[len(prefix):].strip()
     amount, currency, match = extract_amount_currency(rest)
-    tenant_name = normalize_text(rest[:match.start()])
-    details = normalize_text(rest[match.end():])
+
+    # Люди часто пишуть природно: "орендар Вася заплатив 12000 грн".
+    # Прибираємо дієслово з імені, але зберігаємо його в описі.
+    before_amount = normalize_text(rest[:match.start()])
+    verb_match = re.search(
+        r"\b(заплатив(?:ла)?|оплатив(?:ла)?|сплатив(?:ла)?|переказав(?:ла)?|скинув(?:ла)?|дав(?:ла)?|вніс(?:ла)?)\b",
+        before_amount,
+        flags=re.IGNORECASE,
+    )
+    tenant_name = normalize_text(before_amount[:verb_match.start()] if verb_match else before_amount)
+    payment_words = normalize_text(before_amount[verb_match.start():] if verb_match else "")
+    after_amount = normalize_text(rest[match.end():])
+    details = normalize_text(" ".join(part for part in (payment_words, after_amount) if part))
 
     if not tenant_name:
         bot.reply_to(message, "Напиши ім’я або кличку орендаря. Наприклад: <code>орендар Вася 12000 грн оренда</code>")
@@ -1158,6 +1171,7 @@ def handle_tenant_payment(message, text: str) -> bool:
     if details:
         description += f" | {details}"
 
+    # Кожна оплата орендаря є надходженням і збільшує загальну касу.
     sb_insert(
         "cash_operations",
         operation_payload(
@@ -1172,10 +1186,10 @@ def handle_tenant_payment(message, text: str) -> bool:
 
     bot.reply_to(
         message,
-        f"✅ Платіж орендаря записано\n\n"
+        f"✅ Платіж орендаря записано і додано до каси\n\n"
         f"👤 <b>{tenant_name}</b>\n"
         f"🏷 {category}\n"
-        f"💰 <b>{money(amount, currency)}</b>\n"
+        f"💰 <b>+{money(amount, currency)}</b>\n"
         f"📍 Зараховано: {account_name}",
     )
     return True
@@ -1679,7 +1693,7 @@ def cancel_last_logical_operation(message) -> bool:
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v5.2</b>
+<b>Dvir Finance v5.3</b>
 
 Основні команди:
 
@@ -1710,7 +1724,7 @@ HELP_TEXT = """
 <code>борг Bolena</code>
 
 Вечірня каса одним повідомленням:
-<code>каса 25000 грн, базар 3000 грн</code>
+<code>виручка склад 25000 грн, базар 3000 грн</code>
 <code>каса 25000 грн 500 доларів 200 євро</code>
 
 Базар — лише денний продаж. Його сума одразу додається у загальну касу.
@@ -1819,7 +1833,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             message,
             "Не зовсім зрозумів запис. Дані не записував.\n\n"
             "Напиши, наприклад:\n"
-            "<code>каса 25000 грн, базар 3000 грн</code>\n"
+            "<code>виручка склад 25000 грн, базар 3000 грн</code>\n"
             "або натисни /help",
         )
 
@@ -1834,7 +1848,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v5.2 CARD DIRECTIONS запущено")
+    log.info("Dvir Finance Bot v5.3 TENANT TO CASH запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
