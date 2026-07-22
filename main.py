@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v5.0 STABLE
+# Dvir Finance Bot v5.2 CARD DIRECTIONS
 # Telegram + Supabase
 # ============================================================
 
@@ -196,29 +196,46 @@ def get_or_create_account(chat_id: int, account_name: str, currency: str, accoun
 
 
 def account_from_text(text: str, currency: str = "UAH") -> tuple[str, str]:
-    """Recognize one of the three simple money locations used by the business."""
+    """Recognize a person and the exact bank/card destination from natural text."""
     low = text.lower()
 
-    if "микол" in low and "карт" in low:
-        return "Картка Миколи", "personal_card"
-    if "андр" in low and "карт" in low:
-        return "Картка Андрія", "personal_card"
+    person = None
+    if "андр" in low:
+        person = "Андрія"
+    elif "микол" in low:
+        person = "Миколи"
 
-    # All cash currencies live in one logical account: Каса.
-    # Currency remains a separate field, so UAH, USD and EUR never mix.
+    if person:
+        if "півден" in low or "пивден" in low:
+            return f"Банк Південний {person}", "bank_account"
+        if "приват" in low:
+            return f"ПриватБанк {person}", "personal_card"
+        if re.search(r"\bфоп\b", low):
+            return f"ФОП {person}", "business_account"
+        if "карт" in low or "карточ" in low or "рахунок" in low:
+            return f"Картка {person}", "personal_card"
+        # When a person explicitly receives money, their generic card is safer
+        # than silently putting the money into cash.
+        return f"Картка {person}", "personal_card"
+
+    # All physical cash currencies live in one logical account: Каса.
     return "Каса", "cash"
 
 
 def display_account_name(account_name: str | None) -> str:
-    """Merge old account names into the new compact three-account view."""
+    """Keep exact bank accounts visible while merging only legacy cash names."""
     name = normalize_text(account_name or "Каса")
     low = name.lower()
+    if "півден" in low or "пивден" in low:
+        return name
+    if "приват" in low:
+        return name
+    if re.search(r"\bфоп\b", low):
+        return name
     if "микол" in low and "карт" in low:
         return "Картка Миколи"
     if "андр" in low and "карт" in low:
         return "Картка Андрія"
-    # Legacy names such as Сейф, Доларова каса and Євро каса are displayed
-    # inside one Каса, while their currencies stay separate.
     return "Каса"
 
 def default_account_name(text: str, currency: str = "UAH") -> tuple[str, str]:
@@ -498,6 +515,142 @@ def handle_exchange(message, text: str) -> bool:
     return True
 
 
+def handle_external_income(message, text: str) -> bool:
+    """Record money received from an outside person/company into an exact account.
+
+    Examples:
+    - Андрій отримав від Болени 25000 грн
+    - Болена скинула Андрію на ПриватБанк 25000 грн
+    - Від Болени прийшло 25000 грн на ФОП Миколи
+    """
+    low = text.lower()
+    incoming_words = (
+        "отримав", "отримала", "отримали", "прийшло", "зайшло", "надійшло",
+        "скинув", "скинула", "скинули", "перевів", "перевела", "перевели",
+        "оплатив", "оплатила", "оплатили",
+    )
+    if not any(word in low for word in incoming_words):
+        return False
+    if not ("андр" in low or "микол" in low):
+        return False
+
+    try:
+        amount, currency, _ = extract_amount_currency(text)
+    except ValueError:
+        return False
+
+    # Phrases with "з картки ... оплатили" are expenses only when no named
+    # recipient (Andrii/Mykola) is receiving the money.
+    account_name, account_type = account_from_text(text, currency)
+    if account_name == "Каса":
+        return False
+
+    payer = None
+    patterns = (
+        r"(?:від|от)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_'’.-]+)",
+        r"^\s*([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_'’.-]+)\s+(?:скинув|скинула|скинули|перевів|перевела|перевели|оплатив|оплатила|оплатили)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            payer = match.group(1)
+            break
+
+    description = f"Надходження{f' від {payer}' if payer else ''} | {normalize_text(text)}"
+    sb_insert(
+        "cash_operations",
+        operation_payload(
+            message, "income", amount, currency, description,
+            account_name=account_name,
+        ),
+    )
+    bot.reply_to(
+        message,
+        f"✅ <b>Надходження записано</b>\n"
+        f"➕ {money(amount, currency)}\n"
+        f"💳 Рахунок: <b>{account_name}</b>"
+        + (f"\n🏢 Від: <b>{payer}</b>" if payer else ""),
+    )
+    return True
+
+
+
+def handle_direct_account_flow(message, text: str) -> bool:
+    """Handle short, explicit money movements to/from a named card or bank account.
+
+    Examples:
+    - на карту Миколи 8000 грн        -> income to Mykola card
+    - на картку Андрія 5000 грн       -> income to Andrii card
+    - з карти Миколи 3000 грн товар   -> expense from Mykola card
+    - із ФОП Миколи 12000 грн податки -> expense from Mykola FOP account
+
+    Transfers between two internal accounts are deliberately left to
+    handle_transfer().
+    """
+    low = normalize_text(text).lower()
+
+    # Must name one of the owners and an account/card destination.
+    if not ("микол" in low or "андр" in low):
+        return False
+    if not re.search(r"карт|карточ|рахунок|приват|фоп|півден|пивден", low):
+        return False
+
+    # Do not steal true internal transfers such as
+    # "з картки Миколи на картку Андрія 10000 грн".
+    has_source = bool(re.search(r"(?:^|\s)(?:з|із|зі|с)\s+", low))
+    has_destination = bool(re.search(r"(?:^|\s)(?:на|в|у|до)\s+", low))
+    if has_source and has_destination and ("микол" in low and "андр" in low):
+        return False
+
+    try:
+        amount, currency, match = extract_amount_currency(text)
+    except ValueError:
+        return False
+
+    account_name, _ = account_from_text(text, currency)
+    if account_name == "Каса":
+        return False
+
+    incoming = bool(re.search(
+        r"(?:^|\s)(?:на|в|у|до)\s+(?:банківськ\w*\s+)?(?:карт\w*|карточ\w*|рахунок|фоп|приватбанк|приват|банк\s+південний|південний)",
+        low,
+    ))
+    outgoing = bool(re.search(
+        r"(?:^|\s)(?:з|із|зі|с|від)\s+(?:банківськ\w*\s+)?(?:карт\w*|карточ\w*|рахунку|фоп|приватбанку|привату|банку\s+південний|південного)",
+        low,
+    ))
+
+    # Natural verbs can make the direction explicit even when the preposition
+    # is absent or colloquial.
+    if re.search(r"\b(?:отримав|отримала|отримали|прийшло|зайшло|надійшло|поступило)\b", low):
+        incoming = True
+    if re.search(r"\b(?:зняли|зняв|списали|списав|оплатили|оплатив|заплатили|заплатив|витратили)\b", low):
+        outgoing = True
+
+    if incoming == outgoing:
+        return False
+
+    description = normalize_text(text[match.end():]) or normalize_text(text)
+    operation_type = "income" if incoming else "expense"
+    sb_insert(
+        "cash_operations",
+        operation_payload(
+            message, operation_type, amount, currency, description,
+            account_name=account_name,
+        ),
+    )
+
+    sign = "➕" if incoming else "➖"
+    action = "Надходження" if incoming else "Витрату"
+    bot.reply_to(
+        message,
+        f"✅ <b>{action} записано</b>\n"
+        f"{sign} {money(amount, currency)}\n"
+        f"💳 Рахунок: <b>{account_name}</b>"
+        + (f"\n📝 {description}" if description and description != normalize_text(text) else ""),
+    )
+    return True
+
 def handle_natural_expense(message, text: str) -> bool:
     low = text.lower()
     if low.startswith(("витрата", "расход", "видаток", "витрати")):
@@ -672,12 +825,15 @@ Supported canonical forms:
 - орендар Вася 12000 грн оренда
 - борг Bolena 5000 грн опис
 - Bolena оплатила 3000 грн у касу
+- Болена скинула Андрію на ПриватБанк 25000 грн
+- Від Болени прийшло 25000 грн на ФОП Миколи
+- Болена перевела Миколі на Банк Південний 25000 грн
 - ревізія 125000 грн у касі
 - каса / баланс / сьогодні / борги / орендарі / платежі Ім'я / історія / відміна
 Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
 All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
 Bazaar is never a separate balance: its amount is daily sales added immediately to the single general cash account named Каса.
-If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
+Incoming money to Andrii/Mykola is income, never an expense. Preserve the exact destination account: ПриватБанк, ФОП, Банк Південний, or generic картка. If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
 """.strip()
     payload = {
         "model": OPENAI_MODEL,
@@ -1346,13 +1502,16 @@ def cash_summary(chat_id: int) -> str:
             tenant_names.add(first.casefold())
 
     lines = ["💰 <b>Фінансовий стан</b>"]
-    account_order = ["Каса", "Картка Миколи", "Картка Андрія"]
-    currency_order = {"UAH": 0, "USD": 1, "EUR": 2}
+    standard_accounts = ["Каса", "Картка Миколи", "Картка Андрія"]
+    extra_accounts = sorted({account for account, _ in balances if account not in standard_accounts})
+    account_order = standard_accounts + extra_accounts
 
     for account in account_order:
         icon = "💵" if account == "Каса" else "💳"
         lines.append(f"\n{icon} <b>{account}</b>")
-        currencies = ("UAH", "USD", "EUR") if account == "Каса" else ("UAH",)
+        currencies = ("UAH", "USD", "EUR") if account == "Каса" else tuple(
+            curr for curr in ("UAH", "USD", "EUR") if (account, curr) in balances
+        ) or ("UAH",)
         for curr in currencies:
             lines.append(money(balances.get((account, curr), Decimal("0")), curr))
 
@@ -1520,7 +1679,7 @@ def cancel_last_logical_operation(message) -> bool:
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v5.0 Stable</b>
+<b>Dvir Finance v5.2</b>
 
 Основні команди:
 
@@ -1530,7 +1689,10 @@ HELP_TEXT = """
 
 <code>виручка 25000 грн</code>
 <code>витрата 1200 грн бензин</code>
-<code>з картки Миколи оплатили 15000 грн за товар</code>
+<code>на картку Миколи 8000 грн</code>
+<code>з картки Миколи 10000 грн за товар</code>
+<code>на картку Андрія 5000 грн</code>
+<code>з картки Андрія 3000 грн доставка</code>
 
 <code>переклали 10000 грн з картки Миколи в касу</code>
 <code>поміняли 100000 грн на долари по курсу 41,80</code>
@@ -1617,11 +1779,15 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, one_word_hints[low])
             return
 
-        if handle_evening_cash(message, text):
-            return
         if handle_exchange(message, text):
             return
         if handle_transfer(message, text):
+            return
+        if handle_direct_account_flow(message, text):
+            return
+        if handle_external_income(message, text):
+            return
+        if handle_evening_cash(message, text):
             return
         if handle_natural_expense(message, text):
             return
@@ -1668,7 +1834,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v5.0 STABLE запущено")
+    log.info("Dvir Finance Bot v5.2 CARD DIRECTIONS запущено")
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
