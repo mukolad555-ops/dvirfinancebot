@@ -28,7 +28,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 AI_FIRST_MODE = (os.getenv("AI_FIRST_MODE", "false").strip().lower() not in ("0", "false", "no", "off"))
 STABLE_LOCAL_ONLY = (os.getenv("STABLE_LOCAL_ONLY", "true").strip().lower() not in ("0", "false", "no", "off"))
-APP_VERSION = "1.0-STABLE-20260723"
+APP_VERSION = "1.0.3-STABLE-20260723"
 WORKSPACE_CHAT_ID = os.getenv("WORKSPACE_CHAT_ID")
 OWNER_TELEGRAM_IDS = {
     int(x.strip()) for x in (os.getenv("OWNER_TELEGRAM_IDS") or "").split(",")
@@ -299,31 +299,32 @@ def handle_income_expense(message, text: str) -> bool:
     income_words = ("виручка", "дохід", "доход", "прихід", "приход")
     expense_words = ("витрата", "расход", "видаток", "витрати")
 
+    operation_type = None
+    action_label = None
     if low.startswith(income_words):
-        amount, currency, match = extract_amount_currency(text)
-        description = normalize_text(text[match.end():]) or "Виручка"
-        add_cash_operation(message, "income", amount, currency, description)
-        bot.reply_to(
-            message,
-            f"✅ Записано виручку: <b>{money(amount, currency)}</b>\n"
-            f"📍 Рахунок: {default_account_name(description, currency)[0]}\n"
-            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
-        )
-        return True
+        operation_type = "income"
+        action_label = "виручку"
+    elif low.startswith(expense_words):
+        operation_type = "expense"
+        action_label = "витрату"
+    else:
+        return False
 
-    if low.startswith(expense_words):
-        amount, currency, match = extract_amount_currency(text)
-        description = normalize_text(text[match.end():]) or "Витрата"
-        add_cash_operation(message, "expense", amount, currency, description)
-        bot.reply_to(
-            message,
-            f"✅ Записано витрату: <b>{money(amount, currency)}</b>\n"
-            f"📝 {description}\n"
-            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
-        )
-        return True
+    entries = parse_all_amounts(text)
+    if not entries:
+        raise ValueError("Не бачу суму")
 
-    return False
+    description = normalize_text(text) or ("Виручка" if operation_type == "income" else "Витрата")
+    lines = [f"✅ Записано {action_label}:"]
+    for amount, currency in entries:
+        add_cash_operation(message, operation_type, amount, currency, description)
+        sign = "➕" if operation_type == "income" else "➖"
+        lines.append(f"{sign} <b>{money(amount, currency)}</b>")
+    lines.append("📍 Рахунок: Каса")
+    lines.append(f"📝 {description}")
+    lines.append(f"👤 Вніс: {user_fields(message)['telegram_full_name']}")
+    bot.reply_to(message, "\n".join(lines))
+    return True
 
 
 # ------------------------ Transfers and currency exchange ------------------------
@@ -579,39 +580,24 @@ def handle_external_income(message, text: str) -> bool:
 
 
 def handle_direct_account_flow(message, text: str) -> bool:
-    """Handle short, explicit money movements to/from a named card or bank account.
+    """Handle explicit income/expense to or from a named card/bank account.
 
-    Examples:
-    - на карту Миколи 8000 грн        -> income to Mykola card
-    - на картку Андрія 5000 грн       -> income to Andrii card
-    - з карти Миколи 3000 грн товар   -> expense from Mykola card
-    - із ФОП Миколи 12000 грн податки -> expense from Mykola FOP account
-
-    Transfers between two internal accounts are deliberately left to
-    handle_transfer().
+    Supports one or several currencies in one message, for example:
+    "з картки Андрія оплатили товар 100$ 37€".
     """
     low = normalize_text(text).lower()
-
-    # Must name one of the owners and an account/card destination.
     if not ("микол" in low or "андр" in low):
         return False
     if not re.search(r"карт|карточ|рахунок|приват|фоп|півден|пивден", low):
         return False
 
-    # Do not steal true internal transfers such as
-    # "з картки Миколи на картку Андрія 10000 грн".
     has_source = bool(re.search(r"(?:^|\s)(?:з|із|зі|с)\s+", low))
     has_destination = bool(re.search(r"(?:^|\s)(?:на|в|у|до)\s+", low))
     if has_source and has_destination and ("микол" in low and "андр" in low):
         return False
 
-    try:
-        amount, currency, match = extract_amount_currency(text)
-    except ValueError:
-        return False
-
-    account_name, _ = account_from_text(text, currency)
-    if account_name == "Каса":
+    entries = parse_all_amounts(text)
+    if not entries:
         return False
 
     incoming = bool(re.search(
@@ -622,62 +608,58 @@ def handle_direct_account_flow(message, text: str) -> bool:
         r"(?:^|\s)(?:з|із|зі|с|від)\s+(?:банківськ\w*\s+)?(?:карт\w*|карточ\w*|рахунку|фоп|приватбанку|привату|банку\s+південний|південного)",
         low,
     ))
-
-    # Natural verbs can make the direction explicit even when the preposition
-    # is absent or colloquial.
     if re.search(r"\b(?:отримав|отримала|отримали|прийшло|зайшло|надійшло|поступило)\b", low):
         incoming = True
     if re.search(r"\b(?:зняли|зняв|списали|списав|оплатили|оплатив|заплатили|заплатив|витратили)\b", low):
         outgoing = True
-
     if incoming == outgoing:
         return False
 
-    description = normalize_text(text[match.end():]) or normalize_text(text)
     operation_type = "income" if incoming else "expense"
-    sb_insert(
-        "cash_operations",
-        operation_payload(
-            message, operation_type, amount, currency, description,
-            account_name=account_name,
-        ),
-    )
-
     sign = "➕" if incoming else "➖"
     action = "Надходження" if incoming else "Витрату"
-    bot.reply_to(
-        message,
-        f"✅ <b>{action} записано</b>\n"
-        f"{sign} {money(amount, currency)}\n"
-        f"💳 Рахунок: <b>{account_name}</b>"
-        + (f"\n📝 {description}" if description and description != normalize_text(text) else ""),
-    )
+    description = normalize_text(text)
+    lines = [f"✅ <b>{action} записано</b>"]
+    account_display = None
+    for amount, currency in entries:
+        account_name, _ = account_from_text(text, currency)
+        if account_name == "Каса":
+            return False
+        account_display = account_name
+        sb_insert("cash_operations", operation_payload(
+            message, operation_type, amount, currency, description,
+            account_name=account_name,
+        ))
+        lines.append(f"{sign} {money(amount, currency)}")
+    lines.append(f"💳 Рахунок: <b>{account_display}</b>")
+    lines.append(f"📝 {description}")
+    bot.reply_to(message, "\n".join(lines))
     return True
 
 def handle_natural_expense(message, text: str) -> bool:
     low = text.lower()
     if low.startswith(("витрата", "расход", "видаток", "витрати")):
         return False
-    if not re.search(r"\b(оплатили|оплатив|заплатили|заплатив|купили)\b", low):
+    if not re.search(r"\b(оплатили|оплатив|заплатили|заплатив|купили|оплата|сплата|платіж)\b", low):
         return False
-    if not re.search(r"карт|каса|сейф|готів", low):
+    entries = parse_all_amounts(text)
+    if not entries:
         return False
-    try:
-        amount, currency, match = extract_amount_currency(text)
-    except ValueError:
-        return False
-    account_name, _ = account_from_text(text, currency)
+
     description = normalize_text(text) or "Витрата"
-    sb_insert(
-        "cash_operations",
-        operation_payload(message, "expense", amount, currency, description, account_name=account_name),
-    )
-    bot.reply_to(
-        message,
-        f"✅ Записано витрату: <b>{money(amount, currency)}</b>\n"
-        f"📍 Рахунок: {account_name}\n"
-        f"📝 {description}",
-    )
+    lines = ["✅ <b>Витрату записано</b>"]
+    account_display = None
+    for amount, currency in entries:
+        account_name, _ = account_from_text(text, currency)
+        account_display = account_name
+        sb_insert("cash_operations", operation_payload(
+            message, "expense", amount, currency, description,
+            account_name=account_name,
+        ))
+        lines.append(f"➖ {money(amount, currency)}")
+    lines.append(f"📍 Рахунок: <b>{account_display}</b>")
+    lines.append(f"📝 {description}")
+    bot.reply_to(message, "\n".join(lines))
     return True
 
 
@@ -814,6 +796,11 @@ def _expense_signal(low: str) -> bool:
         return True
     if re.search(r"\b(?:сплатив|сплатила|сплатили|оплатив|оплатила|оплатили|заплатив|заплатила|заплатили|витратив|витратила|витратили|списав|списала|списали|купив|купила|купили)\b", low):
         return True
+    # Noun-style everyday wording: "оплата за товар 100$".
+    # In stable mode this is treated as an expense from Cash unless another
+    # account is explicitly named.
+    if re.match(r"^\s*(?:оплата|сплата|платіж)\s+за\b", low):
+        return True
     if re.search(r"(?:^|\s)(?:з|із|зі|с)\s+(?:кас\w*|карт\w*|карточ\w*|рахунк\w*|фоп|приват\w*|банк\w*|півден\w*)", low):
         return True
     return False
@@ -829,18 +816,9 @@ def _income_signal(low: str) -> bool:
     return False
 
 def handle_simple_account_operation(message, text: str) -> bool:
-    """Deterministic handler for ordinary one-account income/expense.
-
-    It deliberately does not use AI. It accepts everyday forms such as:
-    - На карту Андрія 1000 грн
-    - Болена перекинула 5000 грн на картку Андрія
-    - Сплатив за товар з каси 100€
-    - - з каси зарплата 100$
-    - З картки Миколи 500 грн пальне
-    """
+    """Deterministic one-account income/expense, including multi-currency entries."""
     low = normalize_text(text).lower()
 
-    # Dedicated handlers must own these operations.
     if low.startswith(("ревізія", "ревизия", "борг ", "орендар ", "орендарка ", "арендатор ", "виручка", "базар", "склад")):
         return False
     if any(word in low for word in ("помін", "обмін", "обмен")):
@@ -848,16 +826,14 @@ def handle_simple_account_operation(message, text: str) -> bool:
     if re.search(r"\b(?:повернув|повернула|повернення|погасив|погасила)\b.*\bборг", low) or re.search(r"\bборг\b.*\b(?:повернув|повернула|погасив|погасила)\b", low):
         return False
 
-    # A true internal transfer names both a source and a destination.
     if re.search(r"(?:^|\s)(?:з|із|зі|с)\s+", low) and re.search(r"(?:^|\s)(?:на|в|у|до)\s+", low):
         owners = sum(1 for x in ("микол", "андр") if x in low)
         named_accounts = len(re.findall(r"карт|карточ|рахунк|фоп|приват|півден|кас", low))
         if owners >= 2 or named_accounts >= 2:
             return False
 
-    try:
-        amount, currency, match = extract_amount_currency(text)
-    except ValueError:
+    entries = parse_all_amounts(text)
+    if not entries:
         return False
 
     incoming = _income_signal(low)
@@ -865,26 +841,33 @@ def handle_simple_account_operation(message, text: str) -> bool:
     if incoming == outgoing:
         return False
 
-    account_name, _ = account_from_text(text, currency)
-    # If no owner is named but cash is explicitly named, account_from_text already returns Каса.
-    # If neither cash nor a named account is present, do not guess.
+    first_currency = entries[0][1]
+    account_name, _ = account_from_text(text, first_currency)
     named_account = bool(re.search(r"карт|карточ|рахунк|фоп|приват|півден|пивден", low))
-    if account_name == "Каса" and not _has_cash_marker(low):
+    default_cash_expense = outgoing and re.match(r"^\s*(?:оплата|сплата|платіж)\s+за\b", low)
+    if account_name == "Каса" and not _has_cash_marker(low) and not default_cash_expense:
         return False
     if account_name != "Каса" and not named_account:
         return False
 
     operation_type = "income" if incoming else "expense"
     description = normalize_text(text)
-    sb_insert(
-        "cash_operations",
-        operation_payload(message, operation_type, amount, currency, description, account_name=account_name),
-    )
-    if operation_type == "income":
-        bot.reply_to(message, f"✅ <b>Надходження записано</b>\n➕ {money(amount, currency)}\n📍 Рахунок: <b>{account_name}</b>")
-    else:
-        bot.reply_to(message, f"✅ <b>Витрату записано</b>\n➖ {money(amount, currency)}\n📍 Рахунок: <b>{account_name}</b>\n📝 {description}")
+    sign = "➕" if incoming else "➖"
+    action = "Надходження" if incoming else "Витрату"
+    lines = [f"✅ <b>{action} записано</b>"]
+    for amount, currency in entries:
+        current_account, _ = account_from_text(text, currency)
+        sb_insert("cash_operations", operation_payload(
+            message, operation_type, amount, currency, description,
+            account_name=current_account,
+        ))
+        lines.append(f"{sign} {money(amount, currency)}")
+    lines.append(f"📍 Рахунок: <b>{account_name}</b>")
+    if operation_type == "expense":
+        lines.append(f"📝 {description}")
+    bot.reply_to(message, "\n".join(lines))
     return True
+
 
 # ------------------------ Stable deterministic routing ------------------------
 
@@ -1263,9 +1246,12 @@ def handle_debt_payment(message, text: str) -> bool:
             customer = after_amount
             destination_text = ""
     else:
+        # A debt repayment must contain an unmistakable debt-return cue.
+        # Ordinary phrases such as "з картки Андрія оплатили товар 100$"
+        # are expenses and must never be intercepted by the debt handler.
         payment_word = re.search(
-            r"\b(оплатив|оплатила|оплатили|заплатив|заплатила|погасив|погасила|"
-            r"приніс|принесла|закрив|закрила|повернув|повернула|віддав|віддала)\b",
+            r"\b(погасив|погасила|погасили|закрив|закрила|закрили|"
+            r"повернув|повернула|повернули|віддав|віддала|віддали)\b",
             text,
             flags=re.IGNORECASE,
         )
