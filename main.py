@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v6.1 AI ACCOUNTANT
+# Dvir Finance Bot v7.0 STRUCTURED AI ACCOUNTANT
 # Telegram + Supabase
 # ============================================================
 
@@ -819,16 +819,21 @@ def ai_interpret_command(text: str) -> dict | None:
                 "type": "string",
                 "enum": ["understood", "clarify", "ignore"],
             },
+            "operation_type": {
+                "type": "string",
+                "enum": ["revenue", "income", "expense", "transfer", "exchange", "debt_create", "debt_return", "tenant_payment", "revision", "local_command", "none"],
+            },
             "canonical_command": {"type": "string"},
             "clarification": {"type": "string"},
             "reason": {"type": "string"},
         },
-        "required": ["status", "canonical_command", "clarification", "reason"],
+        "required": ["status", "operation_type", "canonical_command", "clarification", "reason"],
     }
     instructions = """
 You are the accounting interpreter for DvirFinance, a Ukrainian Telegram bookkeeping bot.
 Interpret the user's ordinary Ukrainian/Russian message as an accounting event.
-Return exactly one canonical command, or ask one short clarification question.
+Return exactly one canonical command AND its exact operation_type, or ask one short clarification question.
+The program routes operation_type to one dedicated handler, so never label debt_return as income.
 Never invent or alter an amount, currency, name, payer, recipient, source, destination, date or account.
 Do not guess when the direction of money or the destination account is ambiguous.
 
@@ -860,16 +865,16 @@ CANONICAL COMMANDS:
 - переклали 10000 грн з картки Миколи в касу
 - поміняли 100000 грн на долари по курсу 41,80
 - орендар Петро заплатив 4000 грн оренда
-- повернення боргу 1000 грн Боря Гуцул
+- повернення боргу 1000 грн Боря Гуцул  [operation_type=debt_return]
 - повернення боргу 1000 грн Боря Гуцул на картку Миколи
 - борг Боря Гуцул 5000 грн товар
 - ревізія каса 125000 грн 1200 $ 300 €
 - каса | баланс | сьогодні | історія | борги | орендарі | відміна
 
 EXAMPLES:
-"Болена скинула Андрію на Приват 25 тисяч грн" -> understood, "на ПриватБанк Андрія 25000 грн від Болени"
+"Болена скинула Андрію на Приват 25 тисяч грн" -> understood, operation_type=income, "на ПриватБанк Андрія 25000 грн від Болени"
 "Андрій отримав від Болени 25000 грн" -> understood, "на картку Андрія 25000 грн від Болени"
-"Боря Гуцул повернув тисячу гривень" -> understood, "повернення боргу 1000 грн Боря Гуцул"
+"Боря Гуцул повернув тисячу гривень" -> understood, operation_type=debt_return, "повернення боргу 1000 грн Боря Гуцул"
 "орендар Петро дав 4000 за оренду" -> understood, "орендар Петро заплатив 4000 грн оренда"
 "сьогодні склад 20 тисяч, базар 5 тисяч" -> understood, "виручка склад 20000 грн базар 5000 грн"
 "Болена Андрій 25000 грн" -> clarify, ask where the money went and whether this is income.
@@ -926,6 +931,30 @@ def ai_normalize_command(text: str) -> str | None:
     if result and result.get("status") == "understood":
         return result.get("canonical_command") or None
     return None
+
+
+def execute_structured_ai(message, interpretation: dict) -> bool:
+    """Execute exactly one AI-classified operation through one dedicated handler."""
+    kind = interpretation.get("operation_type")
+    command = normalize_text(interpretation.get("canonical_command") or "")
+    if not command:
+        return False
+
+    handlers = {
+        "revenue": handle_evening_cash,
+        "income": handle_external_income,
+        "expense": handle_direct_account_flow,
+        "transfer": handle_transfer,
+        "exchange": handle_exchange,
+        "debt_create": handle_debt_create,
+        "debt_return": handle_debt_payment,
+        "tenant_payment": handle_tenant_payment,
+        "revision": handle_revision,
+    }
+    handler = handlers.get(kind)
+    if not handler:
+        return False
+    return bool(handler(message, command))
 
 # ------------------------ Revisions ------------------------
 
@@ -1899,20 +1928,20 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, one_word_hints[low])
             return
 
-        # v6.0: AI interprets natural transaction language BEFORE broad local
-        # regex handlers. This prevents phrases such as "повернув борг" or
-        # "скинула Андрію" from being stolen by a wrong generic rule.
+        # v7.0: AI classifies the message once, then exactly one dedicated
+        # accounting handler is allowed to execute it. No broad redispatch.
         if allow_ai and AI_FIRST_MODE and OPENAI_API_KEY:
             interpretation = ai_interpret_command(text)
             if interpretation:
                 status = interpretation.get("status")
-                canonical = interpretation.get("canonical_command") or ""
-                if status == "understood" and canonical:
-                    log.info("AI first: %r -> %r", text, canonical)
-                    dispatch_text(message, canonical, allow_ai=False)
+                if status == "understood":
+                    log.info("Structured AI: %r -> %s", text, interpretation)
+                    if execute_structured_ai(message, interpretation):
+                        return
+                    bot.reply_to(message, "⚠️ ШІ зрозумів текст, але перевірка операції не пройшла. Дані не записував.")
                     return
                 if status == "clarify":
-                    question = interpretation.get("clarification") or "Уточни, будь ласка, куди саме пішли гроші і з якого рахунку."
+                    question = interpretation.get("clarification") or "Уточни, будь ласка, операцію."
                     bot.reply_to(message, f"🤔 <b>Потрібне уточнення</b>\n{question}\n\nДані не записував.")
                     return
 
@@ -1948,10 +1977,10 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
         if allow_ai and (not AI_FIRST_MODE) and OPENAI_API_KEY:
             interpretation = ai_interpret_command(text)
             if interpretation:
-                canonical = interpretation.get("canonical_command") or ""
-                if interpretation.get("status") == "understood" and canonical:
-                    log.info("AI fallback: %r -> %r", text, canonical)
-                    dispatch_text(message, canonical, allow_ai=False)
+                if interpretation.get("status") == "understood":
+                    if execute_structured_ai(message, interpretation):
+                        return
+                    bot.reply_to(message, "⚠️ ШІ зрозумів текст, але перевірка операції не пройшла. Дані не записував.")
                     return
                 if interpretation.get("status") == "clarify":
                     question = interpretation.get("clarification") or "Уточни, будь ласка, операцію."
@@ -1977,7 +2006,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v6.1 AI ACCOUNTANT запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
+    log.info("Dvir Finance Bot v7.0 STRUCTURED AI ACCOUNTANT запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
