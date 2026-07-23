@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v6.0 AI FIRST
+# Dvir Finance Bot v6.1 AI ACCOUNTANT
 # Telegram + Supabase
 # ============================================================
 
@@ -801,12 +801,12 @@ def handle_evening_cash(message, text: str) -> bool:
 
 # ------------------------ OpenAI natural-language parser ------------------------
 
-def ai_normalize_command(text: str) -> str | None:
-    """Use OpenAI as the first natural-language interpreter.
+def ai_interpret_command(text: str) -> dict | None:
+    """Interpret natural language before deterministic accounting handlers.
 
-    The model never writes to the database. It only converts the user's words
-    into one strict canonical command, which is then validated and executed by
-    the existing accounting handlers.
+    OpenAI does not write to Supabase. It returns one canonical command or a
+    clarification question. Existing handlers remain the only code allowed to
+    change balances, debts and tenant records.
     """
     if not OPENAI_API_KEY:
         return None
@@ -815,31 +815,38 @@ def ai_normalize_command(text: str) -> str | None:
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "understood": {"type": "boolean"},
+            "status": {
+                "type": "string",
+                "enum": ["understood", "clarify", "ignore"],
+            },
             "canonical_command": {"type": "string"},
+            "clarification": {"type": "string"},
             "reason": {"type": "string"},
         },
-        "required": ["understood", "canonical_command", "reason"],
+        "required": ["status", "canonical_command", "clarification", "reason"],
     }
     instructions = """
-You are the accounting-language interpreter for DvirFinance, a Ukrainian Telegram bookkeeping bot.
-Convert the user's Ukrainian/Russian natural-language message into exactly ONE canonical command.
-Never invent or change amounts, currencies, names, dates, payer, recipient, source, destination, or account.
-If the meaning is genuinely ambiguous or required information is absent, understood=false and canonical_command="".
+You are the accounting interpreter for DvirFinance, a Ukrainian Telegram bookkeeping bot.
+Interpret the user's ordinary Ukrainian/Russian message as an accounting event.
+Return exactly one canonical command, or ask one short clarification question.
+Never invent or alter an amount, currency, name, payer, recipient, source, destination, date or account.
+Do not guess when the direction of money or the destination account is ambiguous.
 
-BUSINESS RULES:
-1. Каса is one shared physical-cash account with UAH, USD and EUR.
-2. Склад and Базар are separate REVENUE SOURCES, but their money is immediately added to Каса.
-3. Incoming money to a person/account is income, never expense.
-4. "на карту/картку/рахунок X" means income TO that account.
-5. "з карти/картки/рахунку X" means expense FROM that account, unless the sentence explicitly describes an internal transfer to another owned account.
-6. Tenant payment is recorded as tenant payment and added to Каса unless another destination account is explicitly stated.
-7. Debt return must reduce the named debtor's debt and add the money to Каса unless another destination account is explicitly stated.
-8. Preserve exact account distinction: Картка Миколи, Картка Андрія, ПриватБанк Миколи/Андрія, ФОП Миколи/Андрія, Банк Південний Миколи/Андрія.
-9. Never interpret "скинула Андрію", "отримав", "прийшло", "зайшло", "надійшло" as an expense.
+CORE BUSINESS RULES:
+1. Каса is one shared physical-cash balance in UAH, USD and EUR.
+2. Склад and Базар are different revenue branches. Their amounts are tracked separately in descriptions and immediately increase Каса.
+3. "на карту/картку/рахунок X", "отримав", "прийшло", "зайшло", "надійшло", "скинули X" are incoming money, never an expense.
+4. "з карти/картки/рахунку X", "оплатили з X", "списали з X" are expenses from that account unless an internal destination is clearly named.
+5. Tenant payment is a tenant payment and increases Каса unless another destination account is explicitly named.
+6. Debt return must reduce the named debtor's debt and increase Каса unless another destination account is explicitly named.
+7. A new debt increases receivables but does not increase Каса.
+8. Internal transfer changes two owned accounts and must not create income or expense.
+9. Preserve exact account distinctions: Картка Миколи, Картка Андрія, ПриватБанк Миколи/Андрія, ФОП Миколи/Андрія, Банк Південний Миколи/Андрія.
 10. Currency aliases: грн/гр/₴=UAH, $/доларів=USD, €/євро=EUR.
+11. If a message contains several independent operations, status=clarify and ask the user to send them separately, except one combined daily revenue message containing Склад and Базар.
+12. If no currency is stated, use UAH only when the amount is clearly monetary and the surrounding accounting context is unambiguous.
 
-CANONICAL FORMS:
+CANONICAL COMMANDS:
 - виручка склад 25000 грн 300 $ 150 € базар 3000 грн
 - склад 25000 грн 300 $
 - базар 3000 грн
@@ -857,20 +864,15 @@ CANONICAL FORMS:
 - повернення боргу 1000 грн Боря Гуцул на картку Миколи
 - борг Боря Гуцул 5000 грн товар
 - ревізія каса 125000 грн 1200 $ 300 €
-- каса
-- баланс
-- сьогодні
-- історія
-- борги
-- орендарі
-- відміна
+- каса | баланс | сьогодні | історія | борги | орендарі | відміна
 
-Examples:
-"Болена скинула Андрію на Приват 25 тисяч грн" -> "на ПриватБанк Андрія 25000 грн від Болени"
-"Андрій отримав від Болени 25000 грн" -> "на картку Андрія 25000 грн від Болени"
-"Боря Гуцул повернув тисячу гривень" -> "повернення боргу 1000 грн Боря Гуцул"
-"орендар Петро дав 4000 за оренду" -> "орендар Петро заплатив 4000 грн оренда"
-"сьогодні склад 20 тисяч, базар 5 тисяч" -> "виручка склад 20000 грн базар 5000 грн"
+EXAMPLES:
+"Болена скинула Андрію на Приват 25 тисяч грн" -> understood, "на ПриватБанк Андрія 25000 грн від Болени"
+"Андрій отримав від Болени 25000 грн" -> understood, "на картку Андрія 25000 грн від Болени"
+"Боря Гуцул повернув тисячу гривень" -> understood, "повернення боргу 1000 грн Боря Гуцул"
+"орендар Петро дав 4000 за оренду" -> understood, "орендар Петро заплатив 4000 грн оренда"
+"сьогодні склад 20 тисяч, базар 5 тисяч" -> understood, "виручка склад 20000 грн базар 5000 грн"
+"Болена Андрій 25000 грн" -> clarify, ask where the money went and whether this is income.
 
 Output only the schema object.
 """.strip()
@@ -907,14 +909,23 @@ Output only the schema object.
                         output_text = content.get("text")
                         break
         parsed = json.loads(output_text or "{}")
-        command = normalize_text(parsed.get("canonical_command") or "")
-        if parsed.get("understood") and command:
-            return command
-        log.info("AI did not understand %r: %s", text, parsed.get("reason"))
+        status = parsed.get("status")
+        parsed["canonical_command"] = normalize_text(parsed.get("canonical_command") or "")
+        parsed["clarification"] = normalize_text(parsed.get("clarification") or "")
+        if status in ("understood", "clarify", "ignore"):
+            return parsed
         return None
     except Exception:
         log.exception("OpenAI parser failed; falling back to local rules")
         return None
+
+
+def ai_normalize_command(text: str) -> str | None:
+    """Backward-compatible helper used by older call sites."""
+    result = ai_interpret_command(text)
+    if result and result.get("status") == "understood":
+        return result.get("canonical_command") or None
+    return None
 
 # ------------------------ Revisions ------------------------
 
@@ -1892,12 +1903,18 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
         # regex handlers. This prevents phrases such as "повернув борг" or
         # "скинула Андрію" from being stolen by a wrong generic rule.
         if allow_ai and AI_FIRST_MODE and OPENAI_API_KEY:
-            canonical = ai_normalize_command(text)
-            if canonical:
-                log.info("AI first: %r -> %r", text, canonical)
-                # Run only validated deterministic accounting code next.
-                dispatch_text(message, canonical, allow_ai=False)
-                return
+            interpretation = ai_interpret_command(text)
+            if interpretation:
+                status = interpretation.get("status")
+                canonical = interpretation.get("canonical_command") or ""
+                if status == "understood" and canonical:
+                    log.info("AI first: %r -> %r", text, canonical)
+                    dispatch_text(message, canonical, allow_ai=False)
+                    return
+                if status == "clarify":
+                    question = interpretation.get("clarification") or "Уточни, будь ласка, куди саме пішли гроші і з якого рахунку."
+                    bot.reply_to(message, f"🤔 <b>Потрібне уточнення</b>\n{question}\n\nДані не записував.")
+                    return
 
         if handle_exchange(message, text):
             return
@@ -1929,11 +1946,17 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             return
 
         if allow_ai and (not AI_FIRST_MODE) and OPENAI_API_KEY:
-            canonical = ai_normalize_command(text)
-            if canonical:
-                log.info("AI fallback: %r -> %r", text, canonical)
-                dispatch_text(message, canonical, allow_ai=False)
-                return
+            interpretation = ai_interpret_command(text)
+            if interpretation:
+                canonical = interpretation.get("canonical_command") or ""
+                if interpretation.get("status") == "understood" and canonical:
+                    log.info("AI fallback: %r -> %r", text, canonical)
+                    dispatch_text(message, canonical, allow_ai=False)
+                    return
+                if interpretation.get("status") == "clarify":
+                    question = interpretation.get("clarification") or "Уточни, будь ласка, операцію."
+                    bot.reply_to(message, f"🤔 <b>Потрібне уточнення</b>\n{question}\n\nДані не записував.")
+                    return
 
         bot.reply_to(
             message,
@@ -1954,7 +1977,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v6.0 AI FIRST запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
+    log.info("Dvir Finance Bot v6.1 AI ACCOUNTANT запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
