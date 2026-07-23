@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v5.3 TENANT TO CASH
+# Dvir Finance Bot v6.0 AI FIRST
 # Telegram + Supabase
 # ============================================================
 
@@ -26,6 +26,7 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+AI_FIRST_MODE = (os.getenv("AI_FIRST_MODE", "true").strip().lower() not in ("0", "false", "no", "off"))
 WORKSPACE_CHAT_ID = os.getenv("WORKSPACE_CHAT_ID")
 OWNER_TELEGRAM_IDS = {
     int(x.strip()) for x in (os.getenv("OWNER_TELEGRAM_IDS") or "").split(",")
@@ -801,6 +802,12 @@ def handle_evening_cash(message, text: str) -> bool:
 # ------------------------ OpenAI natural-language parser ------------------------
 
 def ai_normalize_command(text: str) -> str | None:
+    """Use OpenAI as the first natural-language interpreter.
+
+    The model never writes to the database. It only converts the user's words
+    into one strict canonical command, which is then validated and executed by
+    the existing accounting handlers.
+    """
     if not OPENAI_API_KEY:
         return None
 
@@ -810,31 +817,62 @@ def ai_normalize_command(text: str) -> str | None:
         "properties": {
             "understood": {"type": "boolean"},
             "canonical_command": {"type": "string"},
+            "reason": {"type": "string"},
         },
-        "required": ["understood", "canonical_command"],
+        "required": ["understood", "canonical_command", "reason"],
     }
     instructions = """
-You normalize Ukrainian/Russian bookkeeping messages for DvirFinance.
-Return one canonical command only; never invent amounts, names, currencies, accounts, or dates.
-Supported canonical forms:
-- виручка склад 25000 грн, 300 $, 150 €, базар 3000 грн
-- виручка 25000 грн опис
-- витрата 1200 грн опис
-- з картки Миколи оплатили 1200 грн опис
+You are the accounting-language interpreter for DvirFinance, a Ukrainian Telegram bookkeeping bot.
+Convert the user's Ukrainian/Russian natural-language message into exactly ONE canonical command.
+Never invent or change amounts, currencies, names, dates, payer, recipient, source, destination, or account.
+If the meaning is genuinely ambiguous or required information is absent, understood=false and canonical_command="".
+
+BUSINESS RULES:
+1. Каса is one shared physical-cash account with UAH, USD and EUR.
+2. Склад and Базар are separate REVENUE SOURCES, but their money is immediately added to Каса.
+3. Incoming money to a person/account is income, never expense.
+4. "на карту/картку/рахунок X" means income TO that account.
+5. "з карти/картки/рахунку X" means expense FROM that account, unless the sentence explicitly describes an internal transfer to another owned account.
+6. Tenant payment is recorded as tenant payment and added to Каса unless another destination account is explicitly stated.
+7. Debt return must reduce the named debtor's debt and add the money to Каса unless another destination account is explicitly stated.
+8. Preserve exact account distinction: Картка Миколи, Картка Андрія, ПриватБанк Миколи/Андрія, ФОП Миколи/Андрія, Банк Південний Миколи/Андрія.
+9. Never interpret "скинула Андрію", "отримав", "прийшло", "зайшло", "надійшло" as an expense.
+10. Currency aliases: грн/гр/₴=UAH, $/доларів=USD, €/євро=EUR.
+
+CANONICAL FORMS:
+- виручка склад 25000 грн 300 $ 150 € базар 3000 грн
+- склад 25000 грн 300 $
+- базар 3000 грн
+- виручка 25000 грн
+- витрата каса 1200 грн пальне
+- на картку Миколи 8000 грн від Болени
+- з картки Миколи 3000 грн за товар
+- на ПриватБанк Андрія 25000 грн від Болени
+- на ФОП Миколи 12000 грн від компанії
+- з Банку Південний Андрія 4000 грн податки
 - переклали 10000 грн з картки Миколи в касу
 - поміняли 100000 грн на долари по курсу 41,80
-- орендар Вася 12000 грн оренда
-- борг Bolena 5000 грн опис
-- Bolena оплатила 3000 грн у касу
-- Болена скинула Андрію на ПриватБанк 25000 грн
-- Від Болени прийшло 25000 грн на ФОП Миколи
-- Болена перевела Миколі на Банк Південний 25000 грн
-- ревізія 125000 грн у касі
-- каса / баланс / сьогодні / борги / орендарі / платежі Ім'я / історія / відміна
-Currency symbols are valid: ₴ means UAH, $ means USD, € means EUR.
-All authorized owners work in one shared ledger; do not create separate owner cash ledgers.
-Склад and Базар are two separate revenue sources. They must be preserved as distinct source labels in reports, but both amounts are added immediately to the single general cash account named Каса.
-Incoming money to Andrii/Mykola is income, never an expense. Preserve the exact destination account: ПриватБанк, ФОП, Банк Південний, or generic картка. If the message is ambiguous or lacks a required amount/name, set understood=false and canonical_command="".
+- орендар Петро заплатив 4000 грн оренда
+- повернення боргу 1000 грн Боря Гуцул
+- повернення боргу 1000 грн Боря Гуцул на картку Миколи
+- борг Боря Гуцул 5000 грн товар
+- ревізія каса 125000 грн 1200 $ 300 €
+- каса
+- баланс
+- сьогодні
+- історія
+- борги
+- орендарі
+- відміна
+
+Examples:
+"Болена скинула Андрію на Приват 25 тисяч грн" -> "на ПриватБанк Андрія 25000 грн від Болени"
+"Андрій отримав від Болени 25000 грн" -> "на картку Андрія 25000 грн від Болени"
+"Боря Гуцул повернув тисячу гривень" -> "повернення боргу 1000 грн Боря Гуцул"
+"орендар Петро дав 4000 за оренду" -> "орендар Петро заплатив 4000 грн оренда"
+"сьогодні склад 20 тисяч, базар 5 тисяч" -> "виручка склад 20000 грн базар 5000 грн"
+
+Output only the schema object.
 """.strip()
     payload = {
         "model": OPENAI_MODEL,
@@ -863,7 +901,6 @@ Incoming money to Andrii/Mykola is income, never an expense. Preserve the exact 
         data = response.json()
         output_text = data.get("output_text")
         if not output_text:
-            # Defensive extraction for SDK-independent HTTP use.
             for item in data.get("output", []):
                 for content in item.get("content", []):
                     if content.get("type") == "output_text":
@@ -871,9 +908,12 @@ Incoming money to Andrii/Mykola is income, never an expense. Preserve the exact 
                         break
         parsed = json.loads(output_text or "{}")
         command = normalize_text(parsed.get("canonical_command") or "")
-        return command if parsed.get("understood") and command else None
+        if parsed.get("understood") and command:
+            return command
+        log.info("AI did not understand %r: %s", text, parsed.get("reason"))
+        return None
     except Exception:
-        log.exception("OpenAI parser failed")
+        log.exception("OpenAI parser failed; falling back to local rules")
         return None
 
 # ------------------------ Revisions ------------------------
@@ -1031,23 +1071,75 @@ def handle_debt_queries(message, text: str) -> bool:
 
 
 def handle_debt_payment(message, text: str) -> bool:
-    payment_word = re.search(
-        r"\b(оплатив|оплатила|оплатили|заплатив|заплатила|погасив|погасила|"
-        r"приніс|принесла|закрив|закрила)\b",
-        text,
+    """Record a customer's debt repayment and add the received money to an account.
+
+    Supported examples:
+    - Боря Гуцул повернув 1000 грн
+    - Боря Гуцул погасив борг 1000 грн
+    - повернення боргу 1000 грн Боря Гуцул
+    - повернення боргу 1000 грн Боря Гуцул на картку Миколи
+    """
+    low = normalize_text(text).casefold()
+
+    # Natural form where the amount comes before the customer's name:
+    # "повернення боргу 1000 грн Боря Гуцул"
+    return_prefix = re.match(
+        r"^(?:повернення|повернув|повернула|повернули|віддав|віддала|віддали)\s+борг(?:у)?\s+",
+        low,
         flags=re.IGNORECASE,
     )
-    if not payment_word:
-        return False
 
-    customer = normalize_text(text[:payment_word.start()])
+    if return_prefix:
+        tail = text[return_prefix.end():]
+        try:
+            amount, currency, match = extract_amount_currency(tail)
+        except ValueError:
+            return False
+
+        after_amount = normalize_text(tail[match.end():])
+        if not after_amount:
+            bot.reply_to(
+                message,
+                "Напиши, хто повернув борг, наприклад:\n"
+                "<code>повернення боргу 1000 грн Боря Гуцул</code>",
+            )
+            return True
+
+        # Everything before an explicit destination is the customer's name.
+        destination_match = re.search(
+            r"\b(?:на|в|до)\s+(?:касу|кас[ауі]|карт(?:у|ку|ці)|рахунок|фоп|приватбанк|"
+            r"приват|банк\s+південн(?:ий|ого)|південн(?:ий|ого))\b",
+            after_amount,
+            flags=re.IGNORECASE,
+        )
+        if destination_match:
+            customer = normalize_text(after_amount[:destination_match.start()])
+            destination_text = normalize_text(after_amount[destination_match.start():])
+        else:
+            customer = after_amount
+            destination_text = ""
+    else:
+        payment_word = re.search(
+            r"\b(оплатив|оплатила|оплатили|заплатив|заплатила|погасив|погасила|"
+            r"приніс|принесла|закрив|закрила|повернув|повернула|віддав|віддала)\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not payment_word:
+            return False
+
+        customer = normalize_text(text[:payment_word.start()])
+        if not customer:
+            return False
+
+        tail = text[payment_word.end():]
+        try:
+            amount, currency, match = extract_amount_currency(tail)
+        except ValueError:
+            return False
+        destination_text = normalize_text(tail[match.end():])
+
     if not customer:
-        return False
-
-    tail = text[payment_word.end():]
-    try:
-        amount, currency, match = extract_amount_currency(tail)
-    except ValueError:
         return False
 
     debts = find_open_debts(workspace_id(message), customer)
@@ -1071,13 +1163,10 @@ def handle_debt_payment(message, text: str) -> bool:
         )
         return True
 
-    destination_text = normalize_text(tail[match.end():])
     account_name, account_type = default_account_name(destination_text)
     account = get_or_create_account(workspace_id(message), account_name, currency, account_type)
 
     remaining_payment = amount
-    affected = []
-
     for debt in debts:
         if remaining_payment <= 0:
             break
@@ -1098,7 +1187,7 @@ def handle_debt_payment(message, text: str) -> bool:
                 "currency": currency,
                 "destination_account_id": account["id"],
                 "destination_account_name": account_name,
-                "description": destination_text or f"Оплата боргу {debt['customer_name']}",
+                "description": destination_text or f"Повернення боргу {debt['customer_name']}",
                 "is_cancelled": False,
                 **user_fields(message),
             },
@@ -1111,18 +1200,16 @@ def handle_debt_payment(message, text: str) -> bool:
             "closed_at": datetime.now(KYIV).isoformat() if new_status == "closed" else None,
         }
         sb_update("customer_debts", {"id": f"eq.{debt['id']}"}, update_payload)
-        affected.append((debt["customer_name"], part))
         remaining_payment -= part
 
     left = outstanding_total - amount
     bot.reply_to(
         message,
-        f"✅ Оплату боргу записано\n\n"
+        f"✅ Повернення боргу записано\n\n"
         f"👤 {customer}\n"
         f"💰 Отримано: <b>{money(amount, currency)}</b>\n"
         f"📍 Зараховано: {account_name}\n"
-        f"📒 Залишок боргу: {money(left, currency)}\n"
-        "ℹ️ У виручку повторно не додано.",
+        f"📒 Залишок боргу: {money(left, currency)}",
     )
     return True
 
@@ -1763,6 +1850,14 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
     low = text.lower().strip()
 
     try:
+        if low in ("ai", "ші", "шi", "штучний інтелект", "режим ші", "режим ai"):
+            if OPENAI_API_KEY and AI_FIRST_MODE:
+                bot.reply_to(message, f"🧠 <b>Режим ШІ увімкнено</b>\nМодель: <code>{OPENAI_MODEL}</code>\nСпочатку текст розуміє ШІ, потім операцію перевіряють правила бота.")
+            elif OPENAI_API_KEY:
+                bot.reply_to(message, "🟡 Ключ OpenAI є, але AI_FIRST_MODE вимкнено.")
+            else:
+                bot.reply_to(message, "🔴 Режим ШІ не працює: у Railway немає змінної <code>OPENAI_API_KEY</code>.")
+            return
         if low in ("каса", "баланс", "скільки грошей", "яка фастівська каса", "скільки всього грошей", "що маємо зараз"):
             bot.reply_to(message, cash_summary(workspace_id(message)))
             return
@@ -1793,6 +1888,17 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, one_word_hints[low])
             return
 
+        # v6.0: AI interprets natural transaction language BEFORE broad local
+        # regex handlers. This prevents phrases such as "повернув борг" or
+        # "скинула Андрію" from being stolen by a wrong generic rule.
+        if allow_ai and AI_FIRST_MODE and OPENAI_API_KEY:
+            canonical = ai_normalize_command(text)
+            if canonical:
+                log.info("AI first: %r -> %r", text, canonical)
+                # Run only validated deterministic accounting code next.
+                dispatch_text(message, canonical, allow_ai=False)
+                return
+
         if handle_exchange(message, text):
             return
         if handle_transfer(message, text):
@@ -1822,10 +1928,10 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
         if handle_income_expense(message, text):
             return
 
-        if allow_ai:
+        if allow_ai and (not AI_FIRST_MODE) and OPENAI_API_KEY:
             canonical = ai_normalize_command(text)
-            if canonical and canonical.casefold() != normalize_text(text).casefold():
-                log.info("AI normalized: %r -> %r", text, canonical)
+            if canonical:
+                log.info("AI fallback: %r -> %r", text, canonical)
                 dispatch_text(message, canonical, allow_ai=False)
                 return
 
@@ -1848,7 +1954,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v5.3 TENANT TO CASH запущено")
+    log.info("Dvir Finance Bot v6.0 AI FIRST запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
