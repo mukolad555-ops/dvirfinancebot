@@ -11,7 +11,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v7.0 STRUCTURED AI ACCOUNTANT
+# Dvir Finance Bot 1.0 STABLE
 # Telegram + Supabase
 # ============================================================
 
@@ -26,7 +26,9 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-AI_FIRST_MODE = (os.getenv("AI_FIRST_MODE", "true").strip().lower() not in ("0", "false", "no", "off"))
+AI_FIRST_MODE = (os.getenv("AI_FIRST_MODE", "false").strip().lower() not in ("0", "false", "no", "off"))
+STABLE_LOCAL_ONLY = (os.getenv("STABLE_LOCAL_ONLY", "true").strip().lower() not in ("0", "false", "no", "off"))
+APP_VERSION = "1.0-STABLE-20260723"
 WORKSPACE_CHAT_ID = os.getenv("WORKSPACE_CHAT_ID")
 OWNER_TELEGRAM_IDS = {
     int(x.strip()) for x in (os.getenv("OWNER_TELEGRAM_IDS") or "").split(",")
@@ -799,6 +801,132 @@ def handle_evening_cash(message, text: str) -> bool:
     return True
 
 
+
+
+# ------------------------ Stable simple operations ------------------------
+
+def _has_cash_marker(low: str) -> bool:
+    return bool(re.search(r"\bкас(?:а|и|і|у|ою)\b|\bготівк|\bготівкою", low))
+
+def _expense_signal(low: str) -> bool:
+    stripped = low.lstrip()
+    if stripped.startswith(("-", "мінус ", "минус ")):
+        return True
+    if re.search(r"\b(?:сплатив|сплатила|сплатили|оплатив|оплатила|оплатили|заплатив|заплатила|заплатили|витратив|витратила|витратили|списав|списала|списали|купив|купила|купили)\b", low):
+        return True
+    if re.search(r"(?:^|\s)(?:з|із|зі|с)\s+(?:кас\w*|карт\w*|карточ\w*|рахунк\w*|фоп|приват\w*|банк\w*|півден\w*)", low):
+        return True
+    return False
+
+def _income_signal(low: str) -> bool:
+    stripped = low.lstrip()
+    if stripped.startswith(("+", "плюс ")):
+        return True
+    if re.search(r"\b(?:отримав|отримала|отримали|прийшло|зайшло|надійшло|поступило|перекинув|перекинула|перекинули|скинув|скинула|скинули|перевів|перевела|перевели)\b", low):
+        return True
+    if re.search(r"(?:^|\s)(?:на|в|у|до)\s+(?:кас\w*|карт\w*|карточ\w*|рахунок|фоп|приват\w*|банк\w*|півден\w*)", low):
+        return True
+    return False
+
+def handle_simple_account_operation(message, text: str) -> bool:
+    """Deterministic handler for ordinary one-account income/expense.
+
+    It deliberately does not use AI. It accepts everyday forms such as:
+    - На карту Андрія 1000 грн
+    - Болена перекинула 5000 грн на картку Андрія
+    - Сплатив за товар з каси 100€
+    - - з каси зарплата 100$
+    - З картки Миколи 500 грн пальне
+    """
+    low = normalize_text(text).lower()
+
+    # Dedicated handlers must own these operations.
+    if low.startswith(("ревізія", "ревизия", "борг ", "орендар ", "орендарка ", "арендатор ", "виручка", "базар", "склад")):
+        return False
+    if any(word in low for word in ("помін", "обмін", "обмен")):
+        return False
+    if re.search(r"\b(?:повернув|повернула|повернення|погасив|погасила)\b.*\bборг", low) or re.search(r"\bборг\b.*\b(?:повернув|повернула|погасив|погасила)\b", low):
+        return False
+
+    # A true internal transfer names both a source and a destination.
+    if re.search(r"(?:^|\s)(?:з|із|зі|с)\s+", low) and re.search(r"(?:^|\s)(?:на|в|у|до)\s+", low):
+        owners = sum(1 for x in ("микол", "андр") if x in low)
+        named_accounts = len(re.findall(r"карт|карточ|рахунк|фоп|приват|півден|кас", low))
+        if owners >= 2 or named_accounts >= 2:
+            return False
+
+    try:
+        amount, currency, match = extract_amount_currency(text)
+    except ValueError:
+        return False
+
+    incoming = _income_signal(low)
+    outgoing = _expense_signal(low)
+    if incoming == outgoing:
+        return False
+
+    account_name, _ = account_from_text(text, currency)
+    # If no owner is named but cash is explicitly named, account_from_text already returns Каса.
+    # If neither cash nor a named account is present, do not guess.
+    named_account = bool(re.search(r"карт|карточ|рахунк|фоп|приват|півден|пивден", low))
+    if account_name == "Каса" and not _has_cash_marker(low):
+        return False
+    if account_name != "Каса" and not named_account:
+        return False
+
+    operation_type = "income" if incoming else "expense"
+    description = normalize_text(text)
+    sb_insert(
+        "cash_operations",
+        operation_payload(message, operation_type, amount, currency, description, account_name=account_name),
+    )
+    if operation_type == "income":
+        bot.reply_to(message, f"✅ <b>Надходження записано</b>\n➕ {money(amount, currency)}\n📍 Рахунок: <b>{account_name}</b>")
+    else:
+        bot.reply_to(message, f"✅ <b>Витрату записано</b>\n➖ {money(amount, currency)}\n📍 Рахунок: <b>{account_name}</b>\n📝 {description}")
+    return True
+
+# ------------------------ Stable deterministic routing ------------------------
+
+def handle_income_to_account(message, text: str) -> bool:
+    low = normalize_text(text).lower()
+    if not ("микол" in low or "андр" in low):
+        return False
+    if not re.search(r"карт|карточ|рахунок|приват|фоп|півден|пивден", low):
+        return False
+    if re.search(r"(?:^|\s)(?:з|із|зі|с)\s+", low) and re.search(r"(?:^|\s)(?:на|в|у|до)\s+", low) and "микол" in low and "андр" in low:
+        return False
+    incoming_signal = bool(re.search(r"(?:^|\s)(?:на|в|у|до)\s+(?:банківськ\w*\s+)?(?:карт\w*|карточ\w*|рахунок|фоп|приватбанк|приват|банк\s+південний|південний)", low)) or bool(re.search(r"\b(?:отримав|отримала|отримали|прийшло|зайшло|надійшло|поступило|скинув|скинула|скинули|перекинув|перекинула|перекинули|перевів|перевела|перевели)\b", low))
+    outgoing_signal = bool(re.search(r"(?:^|\s)(?:з|із|зі|с|від)\s+(?:банківськ\w*\s+)?(?:карт\w*|карточ\w*|рахунку|фоп|приватбанку|привату|банку\s+південний|південного)", low)) or bool(re.search(r"\b(?:зняли|зняв|списали|списав|витратили)\b", low))
+    if not incoming_signal or outgoing_signal:
+        return False
+    try:
+        amount, currency, _ = extract_amount_currency(text)
+    except ValueError:
+        return False
+    account_name, _ = account_from_text(text, currency)
+    if account_name == "Каса":
+        return False
+    payer = None
+    for pattern in (r"(?:від|от)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_'’.-]+)", r"^\s*([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_'’.-]+)\s+(?:скинув|скинула|скинули|перекинув|перекинула|перекинули|перевів|перевела|перевели)"):
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if m:
+            payer = m.group(1)
+            break
+    description = normalize_text(text)
+    if payer:
+        description = f"Надходження від {payer} | {description}"
+    sb_insert("cash_operations", operation_payload(message, "income", amount, currency, description, account_name=account_name))
+    bot.reply_to(message, f"✅ <b>Надходження записано</b>\n➕ {money(amount, currency)}\n💳 Рахунок: <b>{account_name}</b>" + (f"\n🏢 Від: <b>{payer}</b>" if payer else ""))
+    return True
+
+def run_stable_handlers(message, text: str) -> bool:
+    handlers = (handle_exchange, handle_transfer, handle_tenant_payment, handle_debt_payment, handle_debt_create, handle_revision, handle_evening_cash, handle_simple_account_operation, handle_income_to_account, handle_direct_account_flow, handle_external_income, handle_natural_expense, handle_daily_closing, handle_income_expense)
+    for handler in handlers:
+        if handler(message, text):
+            return True
+    return False
+
 # ------------------------ OpenAI natural-language parser ------------------------
 
 def ai_interpret_command(text: str) -> dict | None:
@@ -942,7 +1070,7 @@ def execute_structured_ai(message, interpretation: dict) -> bool:
 
     handlers = {
         "revenue": handle_evening_cash,
-        "income": handle_external_income,
+        "income": handle_income_to_account,
         "expense": handle_direct_account_flow,
         "transfer": handle_transfer,
         "exchange": handle_exchange,
@@ -961,51 +1089,22 @@ def execute_structured_ai(message, interpretation: dict) -> bool:
 def handle_revision(message, text: str) -> bool:
     if not text.lower().startswith(("ревізія", "ревизия")):
         return False
-
-    amount, currency, match = extract_amount_currency(text)
-    tail = normalize_text(text[match.end():])
-    account_name, account_type = default_account_name(tail, currency)
-    account = get_or_create_account(workspace_id(message), account_name, currency, account_type)
-
-    previous = sb_select(
-        "cash_revisions",
-        {
-            "select": "*",
-            "telegram_chat_id": f"eq.{workspace_id(message)}",
-            "account_id": f"eq.{account['id']}",
-            "currency": f"eq.{currency}",
-            "order": "revision_date.desc,created_at.desc",
-            "limit": "1",
-        },
-    )
-    revision_type = "control" if previous else "opening"
-
-    created = sb_insert(
-        "cash_revisions",
-        {
-            "revision_date": today_str(),
-            "telegram_chat_id": workspace_id(message),
-            "account_id": account["id"],
-            "account_name": account_name,
-            "currency": currency,
-            "actual_amount": float(amount),
-            "calculated_amount": None,
-            "difference_amount": None,
-            "revision_type": revision_type,
-            "description": tail or "Фактичний залишок",
-            **{k: v for k, v in user_fields(message).items() if k != "telegram_message_id"},
-        },
-    )[0]
-
-    label = "Початкову ревізію" if revision_type == "opening" else "Контрольну ревізію"
-    bot.reply_to(
-        message,
-        f"✅ {label} зафіксовано\n\n"
-        f"📍 {account_name}\n"
-        f"💰 <b>{money(created['actual_amount'], currency)}</b>\n"
-        f"📅 {today_str()}\n"
-        f"👤 {user_fields(message)['telegram_full_name']}",
-    )
+    entries = parse_all_amounts(text)
+    if not entries:
+        raise ValueError("Не бачу суму ревізії")
+    account_name, account_type = default_account_name(text)
+    created_rows = []
+    for amount, currency in entries:
+        account = get_or_create_account(workspace_id(message), account_name, currency, account_type)
+        previous = sb_select("cash_revisions", {"select": "*", "telegram_chat_id": f"eq.{workspace_id(message)}", "account_id": f"eq.{account['id']}", "currency": f"eq.{currency}", "order": "revision_date.desc,created_at.desc", "limit": "1"})
+        revision_type = "control" if previous else "opening"
+        created = sb_insert("cash_revisions", {"revision_date": today_str(), "telegram_chat_id": workspace_id(message), "account_id": account["id"], "account_name": account_name, "currency": currency, "actual_amount": float(amount), "calculated_amount": None, "difference_amount": None, "revision_type": revision_type, "description": normalize_text(text), **{k: v for k, v in user_fields(message).items() if k != "telegram_message_id"}})[0]
+        created_rows.append(created)
+    lines = ["✅ <b>Ревізію зафіксовано</b>", "", f"📍 {account_name}"]
+    for row in created_rows:
+        lines.append(f"💰 {money(row['actual_amount'], row['currency'])}")
+    lines.extend([f"📅 {today_str()}", f"👤 {user_fields(message)['telegram_full_name']}"])
+    bot.reply_to(message, "\n".join(lines))
     return True
 
 
@@ -1029,15 +1128,20 @@ def create_debt(message, customer_name: str, amount: Decimal, currency: str, des
 
 
 def handle_debt_create(message, text: str) -> bool:
-    low = text.lower()
-    if not low.startswith("борг "):
+    low = normalize_text(text).lower()
+    natural = re.match(r"^(.+?)\s+(?:винен|винна|винні|должен|должна)\s+", text, flags=re.IGNORECASE)
+    if low.startswith("борг "):
+        rest = text[5:].strip()
+        amount, currency, match = extract_amount_currency(rest)
+        customer = normalize_text(rest[:match.start()])
+        description = normalize_text(rest[match.end():])
+    elif natural:
+        customer = normalize_text(natural.group(1))
+        rest = text[natural.end():]
+        amount, currency, match = extract_amount_currency(rest)
+        description = normalize_text(rest[match.end():])
+    else:
         return False
-
-    # "борг Bolena 25000 грн полікарбонат"
-    rest = text[5:].strip()
-    amount, currency, match = extract_amount_currency(rest)
-    customer = normalize_text(rest[:match.start()])
-    description = normalize_text(rest[match.end():])
 
     if not customer:
         bot.reply_to(message, "Напиши ім’я покупця: <code>борг Bolena 25000 грн</code>")
@@ -1890,6 +1994,9 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
     low = text.lower().strip()
 
     try:
+        if low in ("версія", "версия", "version", "/version"):
+            bot.reply_to(message, f"✅ <b>DvirFinance {APP_VERSION}</b>\nРежим: локальні перевірені правила\nШІ для запису: {'вимкнено' if STABLE_LOCAL_ONLY else 'дозволено як резерв'}")
+            return
         if low in ("ai", "ші", "шi", "штучний інтелект", "режим ші", "режим ai"):
             if OPENAI_API_KEY and AI_FIRST_MODE:
                 bot.reply_to(message, f"🧠 <b>Режим ШІ увімкнено</b>\nМодель: <code>{OPENAI_MODEL}</code>\nСпочатку текст розуміє ШІ, потім операцію перевіряють правила бота.")
@@ -1928,59 +2035,23 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
             bot.reply_to(message, one_word_hints[low])
             return
 
-        # v7.0: AI classifies the message once, then exactly one dedicated
-        # accounting handler is allowed to execute it. No broad redispatch.
-        if allow_ai and AI_FIRST_MODE and OPENAI_API_KEY:
-            interpretation = ai_interpret_command(text)
-            if interpretation:
-                status = interpretation.get("status")
-                if status == "understood":
-                    log.info("Structured AI: %r -> %s", text, interpretation)
-                    if execute_structured_ai(message, interpretation):
-                        return
-                    bot.reply_to(message, "⚠️ ШІ зрозумів текст, але перевірка операції не пройшла. Дані не записував.")
-                    return
-                if status == "clarify":
-                    question = interpretation.get("clarification") or "Уточни, будь ласка, операцію."
-                    bot.reply_to(message, f"🤔 <b>Потрібне уточнення</b>\n{question}\n\nДані не записував.")
-                    return
-
-        if handle_exchange(message, text):
-            return
-        if handle_transfer(message, text):
-            return
-        if handle_direct_account_flow(message, text):
-            return
-        if handle_external_income(message, text):
-            return
-        if handle_evening_cash(message, text):
-            return
-        if handle_natural_expense(message, text):
-            return
-        if handle_daily_closing(message, text):
-            return
-        if handle_revision(message, text):
-            return
+        # Stable mode: clear commands are executed locally first.
+        # AI is only a fallback for conversational wording.
         if handle_tenant_queries(message, text):
-            return
-        if handle_tenant_payment(message, text):
             return
         if handle_debt_queries(message, text):
             return
-        if handle_debt_create(message, text):
-            return
-        if handle_debt_payment(message, text):
-            return
-        if handle_income_expense(message, text):
+        if run_stable_handlers(message, text):
             return
 
-        if allow_ai and (not AI_FIRST_MODE) and OPENAI_API_KEY:
+        if allow_ai and OPENAI_API_KEY and AI_FIRST_MODE and not STABLE_LOCAL_ONLY:
+
             interpretation = ai_interpret_command(text)
             if interpretation:
                 if interpretation.get("status") == "understood":
                     if execute_structured_ai(message, interpretation):
                         return
-                    bot.reply_to(message, "⚠️ ШІ зрозумів текст, але перевірка операції не пройшла. Дані не записував.")
+                    bot.reply_to(message, f"⚠️ Операцію розпізнано як <code>{interpretation.get('operation_type')}</code>, але локальна перевірка не прийняла команду:\n<code>{interpretation.get('canonical_command')}</code>\n\nДані не записував.")
                     return
                 if interpretation.get("status") == "clarify":
                     question = interpretation.get("clarification") or "Уточни, будь ласка, операцію."
@@ -2006,7 +2077,7 @@ def dispatch_text(message, text: str, allow_ai: bool = True):
 
 
 if __name__ == "__main__":
-    log.info("Dvir Finance Bot v7.0 STRUCTURED AI ACCOUNTANT запущено | AI_FIRST_MODE=%s | OpenAI=%s", AI_FIRST_MODE, bool(OPENAI_API_KEY))
+    log.info("Dvir Finance Bot %s запущено | LOCAL_ONLY=%s | AI_FIRST_MODE=%s | OpenAI=%s", APP_VERSION, STABLE_LOCAL_ONLY, AI_FIRST_MODE, bool(OPENAI_API_KEY))
     bot.infinity_polling(
         timeout=30,
         long_polling_timeout=30,
