@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.3-FINAL-20260724"
+VERSION = "DvirFinance 4.5-CARDS-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -397,6 +397,18 @@ def handle_income_expense(message, text: str) -> bool:
     if not description:
         description = "Виручка" if keyword == "виручка" else "Витрата"
 
+    # Витрата не може створювати від’ємний залишок.
+    if operation_type == "expense":
+        for amount, currency, _ in amounts:
+            available = current_account_balance(message.chat.id, account_name, currency)
+            if amount > available:
+                display_account = "Каса" if account_name == "Сейф" else account_name
+                raise ValueError(
+                    f"Недостатньо коштів на рахунку {display_account}. "
+                    f"Доступно: {money(available, currency)}; потрібно: {money(amount, currency)}. "
+                    "Операцію не записано."
+                )
+
     payloads = []
     for amount, currency, _ in amounts:
         payload = operation_payload(
@@ -483,6 +495,15 @@ def handle_exchange(message, text: str) -> bool:
         raise ValueError("Вихідна й отримана валюти мають бути різними")
 
     account_name, account_type = default_account_name(text)
+    available = current_account_balance(message.chat.id, account_name, from_currency)
+    if from_amount > available:
+        display_account = "Каса" if account_name == "Сейф" else account_name
+        raise ValueError(
+            f"Недостатньо коштів на рахунку {display_account}. "
+            f"Доступно: {money(available, from_currency)}; потрібно: {money(from_amount, from_currency)}. "
+            "Обмін не записано."
+        )
+
     from_account = get_or_create_account(message.chat.id, account_name, from_currency, account_type)
     to_account = get_or_create_account(message.chat.id, account_name, to_currency, account_type)
 
@@ -1082,7 +1103,8 @@ def latest_revisions(chat_id: int):
     return latest
 
 
-def cash_summary(chat_id: int) -> str:
+def calculate_cash_balances(chat_id: int) -> dict:
+    """Поточні залишки по кожному рахунку та валюті."""
     balances = {}
 
     def add(account_name, currency, amount):
@@ -1125,10 +1147,7 @@ def cash_summary(chat_id: int) -> str:
     if closing_map:
         closing_accounts = sb_select(
             "daily_closing_accounts",
-            {
-                "select": "*",
-                "daily_closing_id": f"in.({','.join(closing_map.keys())})",
-            },
+            {"select": "*", "daily_closing_id": f"in.({','.join(closing_map.keys())})"},
         )
         for row in closing_accounts:
             closing = closing_map.get(str(row["daily_closing_id"]))
@@ -1155,6 +1174,77 @@ def cash_summary(chat_id: int) -> str:
         if rev_date and row["payment_date"] <= rev_date:
             continue
         add(key[0], key[1], row["amount"])
+
+    return balances
+
+
+def current_account_balance(chat_id: int, account_name: str, currency: str) -> Decimal:
+    return calculate_cash_balances(chat_id).get((account_name or "Сейф", currency), Decimal("0"))
+
+
+def cards_summary(chat_id: int) -> str:
+    """Show every non-cash bank/card account dynamically, grouped by account and currency."""
+    balances = calculate_cash_balances(chat_id)
+
+    accounts = sb_select(
+        "cash_accounts",
+        {
+            "select": "account_name,account_type,currency,is_active",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "is_active": "eq.true",
+            "order": "account_name.asc,currency.asc",
+        },
+    )
+
+    # A bank account may be created with account_type='other' in older versions,
+    # so the reliable rule is to exclude only the physical cash account.
+    cash_names = {"сейф", "каса", "готівка", "наличка"}
+    bank_names = []
+    seen = set()
+    for row in accounts:
+        name = normalize_text(row.get("account_name") or "")
+        if not name or name.lower() in cash_names:
+            continue
+        if name not in seen:
+            seen.add(name)
+            bank_names.append(name)
+
+    # Include historical balances even if an old account row is missing or inactive.
+    for name, _currency in balances:
+        if name and name.lower() not in cash_names and name not in seen:
+            seen.add(name)
+            bank_names.append(name)
+
+    if not bank_names:
+        return "💳 <b>Карти та банківські рахунки</b>\n\nБанківських рахунків ще немає."
+
+    lines = ["💳 <b>Карти та банківські рахунки</b>"]
+    totals = {}
+    for name in sorted(bank_names, key=str.lower):
+        account_balances = []
+        for currency in ("UAH", "USD", "EUR"):
+            amount = balances.get((name, currency), Decimal("0"))
+            if amount != 0:
+                account_balances.append(money(amount, currency))
+                totals[currency] = totals.get(currency, Decimal("0")) + amount
+        if account_balances:
+            lines.append(f"\n<b>{name}</b>")
+            for value in account_balances:
+                lines.append(f"• {value}")
+        else:
+            lines.append(f"\n<b>{name}</b>\n• 0 грн")
+
+    if totals:
+        lines.append("\n<b>Разом на всіх банківських рахунках:</b>")
+        for currency in ("UAH", "USD", "EUR"):
+            if currency in totals:
+                lines.append(f"• {money(totals[currency], currency)}")
+
+    return "\n".join(lines)
+
+
+def cash_summary(chat_id: int) -> str:
+    balances = calculate_cash_balances(chat_id)
 
     debts = find_open_debts(chat_id)
     debt_totals = {}
@@ -1540,6 +1630,10 @@ def text_handler(message):
             bot.reply_to(message, cash_summary(message.chat.id))
             return
 
+        if low in ("карта", "карти", "картка", "картки", "банки", "рахунки"):
+            bot.reply_to(message, cards_summary(message.chat.id))
+            return
+
         if low in ("звіт", "отчет"):
             bot.reply_to(message, report_text(message.chat.id))
             return
@@ -1552,7 +1646,7 @@ def text_handler(message):
             bot.reply_to(message, latest_operations_text(message.chat.id, int(latest_match.group(1) or 10)))
             return
 
-        cancel_match = re.fullmatch(r"скасувати(?:\s+#?(\d+))?", low)
+        cancel_match = re.fullmatch(r"(?:скасувати|відміна|відмінити)(?:\s+#?(\d+))?", low)
         if cancel_match:
             request_cancel(message, int(cancel_match.group(1)) if cancel_match.group(1) else None)
             return
