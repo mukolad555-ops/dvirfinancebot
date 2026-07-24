@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.5-CARDS-20260724"
+VERSION = "DvirFinance 4.8-AI-EXPENSES-FINAL-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -62,6 +62,7 @@ _legacy_ai_enabled = os.getenv("AI_HELP_ENABLED", "true").lower() in (
 )
 AI_HELP_ENABLED = APP_MODE in {"HYBRID", "AI"} and _legacy_ai_enabled and bool(OPENAI_API_KEY)
 PENDING_AI = {}
+PENDING_DIRECT = {}
 PENDING_ACTIONS = {}
 PENDING_TTL_SECONDS = 900
 
@@ -73,7 +74,7 @@ HEADERS = {
 }
 
 CURRENCY_ALIASES = {
-    "грн": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
+    "грн": "UAH", "гр": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
     "гривні": "UAH", "гривня": "UAH",
     "дол": "USD", "долар": "USD", "долари": "USD", "доларів": "USD",
     "usd": "USD", "$": "USD",
@@ -82,6 +83,108 @@ CURRENCY_ALIASES = {
 
 CURRENCY_SYMBOLS = {"UAH": "грн", "USD": "$", "EUR": "€"}
 
+
+
+EXPENSE_CATEGORY_RULES = {
+    "Зарплата": ("зарплат", "зп", "аванс праців", "оплата праці", "розрахунок праців"),
+    "Товар": ("за товар", "товар", "закуп", "постачаль", "накладн", "прихідн", "приф"),
+    "Пальне": ("бензин", "дизел", "соляр", "пальне", "паливо", "заправ"),
+    "Доставка": ("достав", "перевез", "нова пошта", "логіст", "транспорт"),
+    "Хімія": ("хімія", "химия", "хімікат", "реагент"),
+    "Оренда": ("оренд",),
+    "Податки": ("подат", "єсв", "єдиний податок", "пдв"),
+    "Комунальні": ("комунал", "електро", "світло", "вода", "газ"),
+    "Ремонт": ("ремонт", "запчаст", "сервіс"),
+    "Реклама": ("реклам", "маркетинг", "таргет"),
+}
+
+def expense_details(text: str) -> dict:
+    low = text.lower()
+    category = "Інше"
+    for name, words in EXPENSE_CATEGORY_RULES.items():
+        if any(word in low for word in words):
+            category = name
+            break
+    invoice = None
+    patterns = [
+        r"(?:накладн(?:а|ої|ій|ою)?|нк|invoice)\s*[№#:]?\s*([a-zа-яіїєґ0-9\-/]+)",
+        r"(?:прихідн(?:а|ої|ій)?|приф(?:і|а)?)\s*[№#:]?\s*([a-zа-яіїєґ0-9\-/]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, low, flags=re.IGNORECASE)
+        if m:
+            invoice = m.group(1).upper()
+            break
+    return {"category": category, "invoice": invoice}
+
+def structured_expense_description(raw_description: str) -> tuple[str, dict]:
+    details = expense_details(raw_description)
+    parts = [f"Категорія: {details['category']}"]
+    if details.get("invoice"):
+        parts.append(f"Накладна: {details['invoice']}")
+    cleaned = normalize_text(raw_description) or details['category']
+    parts.append(cleaned)
+    return " | ".join(parts), details
+
+def expense_preview_text(command: str) -> str:
+    try:
+        tail = keyword_tail(command, "витрата")
+        amounts = extract_all_amounts_currency(tail)
+        account_name, _ = default_account_name(command)
+        description = tail
+        for _, _, match in reversed(amounts):
+            description = description[:match.start()] + " " + description[match.end():]
+        description = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", description))
+        details = expense_details(description)
+        display_account = "Каса" if account_name == "Сейф" else account_name
+        lines = ["🧾 <b>Перевір витрату</b>", ""]
+        lines += [f"➖ <b>{money(a, c)}</b>" for a,c,_ in amounts]
+        lines.append(f"💳 Рахунок: <b>{display_account}</b>")
+        lines.append(f"📂 Категорія: <b>{details['category']}</b>")
+        if details.get('invoice'):
+            lines.append(f"📄 Накладна: <b>{details['invoice']}</b>")
+        lines.append(f"📝 Призначення: {description or details['category']}")
+        lines.append("\nНічого ще не записано.")
+        return "\n".join(lines)
+    except Exception:
+        return "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{command}</code>" + "\n\nНічого ще не записано."
+
+def expense_report_text(chat_id: int, category_filter: str | None = None) -> str:
+    rows = sb_select("cash_operations", {
+        "select": "created_at,amount,currency,description,account_name",
+        "telegram_chat_id": f"eq.{chat_id}",
+        "operation_type": "eq.expense",
+        "is_cancelled": "eq.false",
+        "order": "created_at.desc",
+        "limit": "500",
+    })
+    totals = {}
+    recent = []
+    for row in rows:
+        desc = row.get("description") or ""
+        m = re.search(r"Категорія:\s*([^|]+)", desc, flags=re.IGNORECASE)
+        cat = normalize_text(m.group(1)) if m else expense_details(desc)["category"]
+        if category_filter and category_filter.lower() not in cat.lower():
+            continue
+        key=(cat,row.get("currency") or "UAH")
+        totals[key]=totals.get(key,Decimal("0"))+Decimal(str(row.get("amount") or 0))
+        if len(recent)<10:
+            inv=re.search(r"Накладна:\s*([^|]+)",desc,flags=re.IGNORECASE)
+            recent.append((row,cat,normalize_text(inv.group(1)) if inv else None))
+    if not totals:
+        return "Витрат за цим запитом не знайдено."
+    title = f"📊 <b>Витрати — {category_filter}</b>" if category_filter else "📊 <b>Витрати за категоріями</b>"
+    lines=[title,""]
+    cats=sorted(set(cat for cat,_ in totals))
+    for cat in cats:
+        vals=[money(totals[(cat,c)],c) for c in ("UAH","USD","EUR") if (cat,c) in totals]
+        lines.append(f"• <b>{cat}</b>: " + ", ".join(vals))
+    lines.append("\n<b>Останні витрати:</b>")
+    for row,cat,inv in recent:
+        account = row.get('account_name') or 'Каса'
+        detail=f" · накладна {inv}" if inv else ""
+        lines.append(f"• {money(row.get('amount'),row.get('currency') or 'UAH')} · {cat}{detail} · {account}")
+    return "\n".join(lines)
 
 # ------------------------ Supabase ------------------------
 
@@ -175,7 +278,7 @@ def money(value, currency: str) -> str:
 def extract_amount_currency(text: str):
     pattern = (
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?"
     )
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -364,7 +467,7 @@ def extract_all_amounts_currency(text: str):
     """Read every explicit amount+currency pair, including compact input: 300$,250€."""
     pattern = re.compile(
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
         flags=re.IGNORECASE,
     )
@@ -396,6 +499,9 @@ def handle_income_expense(message, text: str) -> bool:
     description = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", description))
     if not description:
         description = "Виручка" if keyword == "виручка" else "Витрата"
+    expense_meta = None
+    if operation_type == "expense":
+        description, expense_meta = structured_expense_description(description)
 
     # Витрата не може створювати від’ємний залишок.
     if operation_type == "expense":
@@ -427,11 +533,16 @@ def handle_income_expense(message, text: str) -> bool:
     )
     title = "✅ Виручку записано" if keyword == "виручка" else "✅ Витрату записано"
     account_line = "Зараховано" if keyword == "виручка" else "Списано"
+    extra = ""
+    if operation_type == "expense" and expense_meta:
+        extra = f"\n📂 Категорія: {expense_meta['category']}"
+        if expense_meta.get('invoice'):
+            extra += f"\n📄 Накладна: {expense_meta['invoice']}"
     bot.reply_to(
         message,
         f"{title}\n\n{amounts_text}\n"
-        f"📍 {account_line}: {display_account}\n"
-        f"📝 {description}",
+        f"📍 {account_line}: {display_account}"
+        f"{extra}\n📝 {description}",
     )
     return True
 
@@ -439,7 +550,7 @@ def handle_income_expense(message, text: str) -> bool:
 # ------------------------ Currency exchange ------------------------
 
 def _currency_word_pattern() -> str:
-    return r"грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€"
+    return r"грн|гр|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€"
 
 
 def handle_exchange(message, text: str) -> bool:
@@ -542,12 +653,14 @@ def handle_exchange(message, text: str) -> bool:
 # ------------------------ Revisions ------------------------
 
 def handle_revision(message, text: str) -> bool:
-    if not text.lower().startswith(("ревізія", "ревизия")):
+    if first_keyword(text) not in ("ревізія", "ревизия", "залишок", "остаток"):
         return False
 
     amount, currency, match = extract_amount_currency(text)
     tail = normalize_text(text[match.end():])
     account_name, account_type = default_account_name(tail)
+    calculated_before = current_account_balance(message.chat.id, account_name, currency)
+    difference = amount - calculated_before
     account = get_or_create_account(message.chat.id, account_name, currency, account_type)
 
     previous = sb_select(
@@ -572,8 +685,8 @@ def handle_revision(message, text: str) -> bool:
             "account_name": account_name,
             "currency": currency,
             "actual_amount": float(amount),
-            "calculated_amount": None,
-            "difference_amount": None,
+            "calculated_amount": float(calculated_before),
+            "difference_amount": float(difference),
             "revision_type": revision_type,
             "description": tail or "Фактичний залишок",
             **{k: v for k, v in user_fields(message).items() if k != "telegram_message_id"},
@@ -586,6 +699,8 @@ def handle_revision(message, text: str) -> bool:
         f"✅ {label} зафіксовано\n\n"
         f"📍 {account_name}\n"
         f"💰 <b>{money(created['actual_amount'], currency)}</b>\n"
+        f"Було за обліком: {money(calculated_before, currency)}\n"
+        f"Коригування: {money(difference, currency)}\n"
         f"📅 {today_str()}\n"
         f"👤 {user_fields(message)['telegram_full_name']}",
     )
@@ -837,6 +952,10 @@ def ai_suggest_canonical(text: str) -> str | None:
 - ревізія: фактичний залишок
 - обмін: обмін однієї валюти на іншу з указаним курсом або двома сумами
 
+Для витрати збережи в команді всі слова про призначення. Виправляй очевидні помилки: грн/гр, карточка/картка, Південний, ФОП.
+Розпізнавай категорії: товар, пальне/бензин, зарплата, доставка, хімія, оренда, податки, комунальні, ремонт, реклама.
+Обов'язково збережи номер накладної, навіть якщо написано з помилкою: «накладна 428», «згідно накладної №428», «прихідна 428», «прифі 428».
+
 Правила:
 1) Поверни тільки один рядок без пояснень.
 2) Не вигадуй суму, валюту, ім'я або рахунок.
@@ -858,6 +977,93 @@ def ai_suggest_canonical(text: str) -> str | None:
     if suggestion.upper().startswith("НЕЗРОЗУМІЛО") or not canonical_command_is_safe(suggestion):
         return None
     return suggestion
+
+
+def cleanup_pending_direct():
+    cutoff = time.time() - PENDING_TTL_SECONDS
+    for key in list(PENDING_DIRECT):
+        if PENDING_DIRECT[key]["created"] < cutoff:
+            PENDING_DIRECT.pop(key, None)
+
+
+def offer_direct_confirmation(message, original_text: str) -> bool:
+    """Show a mandatory preview before any bookkeeping write. Nothing is saved here."""
+    cleanup_pending_direct()
+    suggestion = original_text
+    if AI_HELP_ENABLED:
+        try:
+            ai_suggestion = ai_suggest_canonical(original_text)
+            if ai_suggestion:
+                suggestion = ai_suggestion
+        except Exception:
+            log.exception("AI normalization failed; using original command")
+
+    token = uuid.uuid4().hex[:12]
+    PENDING_DIRECT[token] = {
+        "created": time.time(),
+        "chat_id": message.chat.id,
+        "user_id": message.from_user.id,
+        "message_id": message.message_id,
+        "suggestion": suggestion,
+        "original": original_text,
+        "user": {
+            "id": message.from_user.id,
+            "username": message.from_user.username,
+            "first_name": message.from_user.first_name,
+            "last_name": message.from_user.last_name,
+        },
+    }
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("✅ Підтвердити", callback_data=f"direct_yes:{token}"),
+        telebot.types.InlineKeyboardButton("❌ Скасувати", callback_data=f"direct_no:{token}"),
+    )
+    preview = expense_preview_text(suggestion) if first_keyword(suggestion) == "витрата" else (
+        "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{suggestion}</code>" + "\n\nНічого ще не записано."
+    )
+    bot.reply_to(
+        message,
+        preview + "\n\nПідтвердити цю операцію?",
+        reply_markup=markup,
+    )
+    return True
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("direct_yes:", "direct_no:")))
+def direct_confirmation_handler(call):
+    cleanup_pending_direct()
+    action, token = call.data.split(":", 1)
+    pending = PENDING_DIRECT.get(token)
+    if not pending or pending["chat_id"] != call.message.chat.id:
+        bot.answer_callback_query(call.id, "Підтвердження застаріло")
+        return
+    if pending["user_id"] != call.from_user.id:
+        bot.answer_callback_query(call.id, "Підтвердити може лише автор повідомлення")
+        return
+    PENDING_DIRECT.pop(token, None)
+    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+    if action == "direct_no":
+        bot.answer_callback_query(call.id, "Скасовано. Нічого не записано")
+        bot.send_message(call.message.chat.id, "❌ Операцію скасовано. Дані не змінено.")
+        return
+
+    u = pending["user"]
+    fake_message = SimpleNamespace(
+        chat=call.message.chat,
+        from_user=SimpleNamespace(**u),
+        message_id=pending["message_id"],
+        text=pending["suggestion"],
+    )
+    try:
+        if execute_canonical(fake_message, pending["suggestion"]):
+            bot.answer_callback_query(call.id, "Операцію записано")
+        else:
+            bot.answer_callback_query(call.id, "Не вдалося розпізнати операцію")
+            bot.send_message(call.message.chat.id, "⚠️ Операцію не записано: не вдалося однозначно розпізнати команду.")
+    except Exception as exc:
+        log.exception("Direct confirmation failed")
+        bot.answer_callback_query(call.id, "Операцію не записано")
+        bot.send_message(call.message.chat.id, f"⚠️ Операцію не записано. {str(exc)[:500]}")
 
 def cleanup_pending_ai():
     cutoff = time.time() - PENDING_TTL_SECONDS
@@ -1112,10 +1318,10 @@ def calculate_cash_balances(chat_id: int) -> dict:
         balances[key] = balances.get(key, Decimal("0")) + Decimal(str(amount or 0))
 
     revisions = latest_revisions(chat_id)
-    revision_dates = {}
+    revision_moments = {}
     for key, row in revisions.items():
         balances[key] = Decimal(str(row["actual_amount"]))
-        revision_dates[key] = row["revision_date"]
+        revision_moments[key] = row.get("created_at") or (str(row["revision_date"]) + "T23:59:59+00:00")
 
     operations = sb_select(
         "cash_operations",
@@ -1128,8 +1334,9 @@ def calculate_cash_balances(chat_id: int) -> dict:
     )
     for row in operations:
         key = (row.get("account_name") or "Сейф", row["currency"])
-        rev_date = revision_dates.get(key)
-        if rev_date and row["operation_date"] <= rev_date:
+        rev_moment = revision_moments.get(key)
+        row_moment = row.get("created_at") or (str(row["operation_date"]) + "T00:00:00+00:00")
+        if rev_moment and row_moment <= rev_moment:
             continue
         sign = Decimal("1") if row["operation_type"] in ("income", "exchange_in") else Decimal("-1")
         add(key[0], key[1], sign * Decimal(str(row["amount"])))
@@ -1137,7 +1344,7 @@ def calculate_cash_balances(chat_id: int) -> dict:
     closings = sb_select(
         "daily_closings",
         {
-            "select": "id,closing_date,currency",
+            "select": "id,closing_date,currency,created_at",
             "telegram_chat_id": f"eq.{chat_id}",
             "is_cancelled": "eq.false",
             "order": "closing_date.asc",
@@ -1154,8 +1361,9 @@ def calculate_cash_balances(chat_id: int) -> dict:
             if not closing:
                 continue
             key = (row["account_name"], closing["currency"])
-            rev_date = revision_dates.get(key)
-            if rev_date and closing["closing_date"] <= rev_date:
+            rev_moment = revision_moments.get(key)
+            closing_moment = closing.get("created_at") or (str(closing["closing_date"]) + "T00:00:00+00:00")
+            if rev_moment and closing_moment <= rev_moment:
                 continue
             add(key[0], key[1], row["amount"])
 
@@ -1170,8 +1378,9 @@ def calculate_cash_balances(chat_id: int) -> dict:
     )
     for row in payments:
         key = (row.get("destination_account_name") or "Сейф", row["currency"])
-        rev_date = revision_dates.get(key)
-        if rev_date and row["payment_date"] <= rev_date:
+        rev_moment = revision_moments.get(key)
+        row_moment = row.get("created_at") or (str(row["payment_date"]) + "T00:00:00+00:00")
+        if rev_moment and row_moment <= rev_moment:
             continue
         add(key[0], key[1], row["amount"])
 
@@ -1579,6 +1788,9 @@ HELP_TEXT = """
 <code>аванс 1000$ натяжні потолки</code>
 ➕ отриманий аванс у касу
 
+<code>залишок 822 долари каса</code>
+🎯 встановлює точний фактичний залишок і прибирає старий мінус
+
 <code>ревізія 125000 грн у касі</code>
 
 <code>обмін 10000 грн на долари курс 45</code>
@@ -1586,6 +1798,9 @@ HELP_TEXT = """
 <code>борги</code>
 <code>каса</code>
 <code>звіт</code>
+<code>витрати</code> — підсумок за категоріями
+<code>витрати зарплата</code>
+<code>витрати товар</code>
 <code>останні</code>
 <code>скасувати</code>
 <code>скасувати #127</code>
@@ -1638,6 +1853,11 @@ def text_handler(message):
             bot.reply_to(message, report_text(message.chat.id))
             return
 
+        expense_match = re.fullmatch(r"витрати(?:\s+(.+))?", low)
+        if expense_match:
+            bot.reply_to(message, expense_report_text(message.chat.id, expense_match.group(1)))
+            return
+
         if finish_reset_if_expected(message, text):
             return
 
@@ -1655,28 +1875,23 @@ def text_handler(message):
             request_reset(message)
             return
 
-        if handle_revision(message, text):
-            return
         if handle_debt_queries(message, text):
             return
-        # STRICT: тільки локальні перевірені правила.
-        # HYBRID: спочатку локальні правила, потім AI-підказка з підтвердженням.
-        # AI: спочатку AI-підказка з підтвердженням; якщо AI не допоміг — локальні правила.
-        if APP_MODE == "AI":
-            if offer_ai_suggestion(message, text):
-                return
-            if execute_canonical(message, text):
-                return
-        else:
-            if execute_canonical(message, text):
-                return
-            if APP_MODE == "HYBRID" and offer_ai_suggestion(message, text):
-                return
+
+        # Усі бухгалтерські записи проходять обов'язковий попередній перегляд.
+        write_keywords = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін"}
+        if first_keyword(text) in write_keywords:
+            offer_direct_confirmation(message, text)
+            return
+
+        # Для фраз із помилками ШІ лише пропонує безпечну канонічну команду.
+        if APP_MODE in ("AI", "HYBRID") and offer_ai_suggestion(message, text):
+            return
 
         bot.reply_to(
             message,
             "Не зрозумів перше ключове слово. Дані не записував.\n\n"
-            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, ревізія, обмін</b>.\n"
+            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, залишок, ревізія, обмін</b>.\n"
             "Приклад: <code>повернення Болена 2000 грн в касу</code>",
         )
 
