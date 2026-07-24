@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 5.2-AI-FULL-20260724"
+VERSION = "DvirFinance 5.3-AI-CONNECTION-FIX-20260724"
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
@@ -1059,7 +1059,8 @@ def _openai_response(prompt: str, max_output_tokens: int = 220) -> tuple[str | N
                     "model": model,
                     "input": prompt,
                     "store": False,
-                    "max_output_tokens": max_output_tokens,
+                    "max_output_tokens": max(64, max_output_tokens),
+                    **({"reasoning": {"effort": "minimal"}} if model.startswith("gpt-5") else {}),
                 },
                 timeout=AI_TIMEOUT_SECONDS,
             )
@@ -1083,7 +1084,7 @@ def _openai_response(prompt: str, max_output_tokens: int = 220) -> tuple[str | N
 def ai_live_status() -> tuple[bool, str]:
     if not OPENAI_API_KEY:
         return False, "ключ не знайдено"
-    text, error = _openai_response('Поверни тільки слово OK', max_output_tokens=12)
+    text, error = _openai_response('Поверни тільки слово OK без пояснень.', max_output_tokens=128)
     if text and text.strip().upper().startswith("OK"):
         return True, "зв’язок працює"
     return False, error or "немає коректної відповіді"
