@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.8-AI-EXPENSES-FINAL-20260724"
+VERSION = "DvirFinance 5.0-TESTED-CORE-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -319,30 +319,69 @@ def get_or_create_account(chat_id: int, account_name: str, currency: str, accoun
     return created[0]
 
 
+def canonical_account_name(raw_name: str) -> str:
+    """Normalize common Ukrainian/Russian account-name variants to one canonical name."""
+    name = normalize_text(raw_name)
+    low = name.lower()
+    replacements = {
+        "карточка": "Картка",
+        "карта": "Картка",
+        "картка": "Картка",
+        "южний": "Південний",
+        "южный": "Південний",
+        "південний": "Південний",
+        "приватбанк": "Приват",
+        "приват": "Приват",
+        "фоп": "ФОП",
+    }
+    owner = None
+    if "микол" in low or "никол" in low:
+        owner = "Миколи"
+    elif "андр" in low:
+        owner = "Андрія"
+
+    if any(x in low for x in ("півден", "южн")):
+        return f"Південний {owner}" if owner else "Південний"
+    if "приват" in low:
+        return f"Приват {owner}" if owner else "Приват"
+    if "фоп" in low:
+        return f"ФОП {owner}" if owner else "ФОП"
+    if any(x in low for x in ("картк", "карточ", "карта")):
+        return f"Картка {owner}" if owner else "Картка"
+    if low in ("сейф", "каса", "готівка", "наличка"):
+        return "Сейф"
+    return name
+
+
 def default_account_name(text: str) -> tuple[str, str]:
     low = text.lower()
-    # У базі історично рахунок готівки має назву "Сейф".
-    # Слова "каса", "готівка", "наличка" ведуть на той самий рахунок,
-    # щоб не розділити старий і новий баланс на два рахунки.
-    if (
-        "сейф" in low
-        or "кас" in low
-        or "готів" in low
-        or "налич" in low
-    ):
+
+    # Detect named bank accounts anywhere in the phrase, not only after "на картку".
+    bank_patterns = [
+        (r"(?:південн(?:ий|ого|ому)|южн(?:ий|ого|ому)|южный)", "bank"),
+        (r"приват(?:банк)?", "bank"),
+        (r"\bфоп\b", "fop_account"),
+        (r"карт(?:ка|ки|ку|ці|кою|у)|карточ(?:ка|ки|ку|ке|кой)|\bкарта\b", "personal_card"),
+    ]
+    for pattern, account_type in bank_patterns:
+        if re.search(pattern, low, flags=re.IGNORECASE):
+            owner = None
+            if re.search(r"микол|никол", low):
+                owner = "Миколи"
+            elif re.search(r"андр", low):
+                owner = "Андрія"
+
+            if re.search(r"півден|южн", low):
+                return (f"Південний {owner}" if owner else "Південний", account_type)
+            if "приват" in low:
+                return (f"Приват {owner}" if owner else "Приват", account_type)
+            if re.search(r"\bфоп\b", low):
+                return (f"ФОП {owner}" if owner else "ФОП", account_type)
+            return (f"Картка {owner}" if owner else "Картка", account_type)
+
+    # Physical cash account.
+    if "сейф" in low or "кас" in low or "готів" in low or "налич" in low:
         return "Сейф", "safe"
-
-    card_match = re.search(
-        r"(?:на|у|в)\s+(?:особисту\s+|фоп(?:івську)?\s+)?карт(?:ку|у|ці|ка)\s+(.+)$",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if card_match:
-        owner = normalize_text(card_match.group(1))
-        return f"Картка {owner}", "personal_card"
-
-    if "фоп" in low and "карт" in low:
-        return "ФОП-картка", "fop_card"
 
     return "Сейф", "safe"
 
@@ -543,6 +582,51 @@ def handle_income_expense(message, text: str) -> bool:
         f"{title}\n\n{amounts_text}\n"
         f"📍 {account_line}: {display_account}"
         f"{extra}\n📝 {description}",
+    )
+    return True
+
+
+
+def handle_transfer(message, text: str) -> bool:
+    """Move money between own accounts without changing the overall total."""
+    if first_keyword(text) != "переказ":
+        return False
+
+    tail = keyword_tail(text, "переказ")
+    amount, currency, match = extract_amount_currency(tail)
+    rest = normalize_text(tail[:match.start()] + " " + tail[match.end():])
+    m = re.search(r"(?:^|\s)з\s+(.+?)\s+на\s+(.+)$", rest, flags=re.IGNORECASE)
+    if not m:
+        raise ValueError("Напиши: переказ 5000 грн з Каси на Картку Андрія")
+
+    source_raw, destination_raw = normalize_text(m.group(1)), normalize_text(m.group(2))
+    source_name, _ = default_account_name(source_raw)
+    destination_name, _ = default_account_name(destination_raw)
+    if source_name == destination_name:
+        raise ValueError("Рахунок списання і рахунок зарахування мають бути різними")
+
+    available = current_account_balance(message.chat.id, source_name, currency)
+    if amount > available:
+        source_display = "Каса" if source_name == "Сейф" else source_name
+        raise ValueError(
+            f"Недостатньо коштів на рахунку {source_display}. "
+            f"Доступно: {money(available, currency)}; потрібно: {money(amount, currency)}."
+        )
+
+    group = str(uuid.uuid4())
+    description = f"Переказ з {'Каса' if source_name == 'Сейф' else source_name} " \
+                  f"на {'Каса' if destination_name == 'Сейф' else destination_name}"
+    out_payload = operation_payload(message, "transfer_out", amount, currency, description, source_name)
+    in_payload = operation_payload(message, "transfer_in", amount, currency, description, destination_name)
+    out_payload["operation_group"] = group
+    in_payload["operation_group"] = group
+    sb_insert("cash_operations", [out_payload, in_payload])
+
+    bot.reply_to(
+        message,
+        "✅ Переказ записано\n\n"
+        f"↘️ {money(amount, currency)} — {'Каса' if source_name == 'Сейф' else source_name}\n"
+        f"↗️ {money(amount, currency)} — {'Каса' if destination_name == 'Сейф' else destination_name}",
     )
     return True
 
@@ -915,7 +999,7 @@ def handle_debt_payment(message, text: str) -> bool:
 
 # ------------------------ Hybrid AI helper ------------------------
 
-CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "обмін"}
+CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "обмін", "переказ"}
 
 def canonical_command_is_safe(command: str) -> bool:
     command = normalize_text(command)
@@ -1075,6 +1159,7 @@ def execute_canonical(message, text: str) -> bool:
     for handler in (
         handle_revision,
         handle_exchange,
+        handle_transfer,
         handle_debt_payment,
         handle_debt_create,
         handle_advance,
@@ -1338,7 +1423,7 @@ def calculate_cash_balances(chat_id: int) -> dict:
         row_moment = row.get("created_at") or (str(row["operation_date"]) + "T00:00:00+00:00")
         if rev_moment and row_moment <= rev_moment:
             continue
-        sign = Decimal("1") if row["operation_type"] in ("income", "exchange_in") else Decimal("-1")
+        sign = Decimal("1") if row["operation_type"] in ("income", "exchange_in", "transfer_in") else Decimal("-1")
         add(key[0], key[1], sign * Decimal(str(row["amount"])))
 
     closings = sb_select(
@@ -1391,93 +1476,128 @@ def current_account_balance(chat_id: int, account_name: str, currency: str) -> D
     return calculate_cash_balances(chat_id).get((account_name or "Сейф", currency), Decimal("0"))
 
 
-def cards_summary(chat_id: int) -> str:
-    """Show every non-cash bank/card account dynamically, grouped by account and currency."""
-    balances = calculate_cash_balances(chat_id)
-
-    accounts = sb_select(
-        "cash_accounts",
-        {
-            "select": "account_name,account_type,currency,is_active",
-            "telegram_chat_id": f"eq.{chat_id}",
-            "is_active": "eq.true",
-            "order": "account_name.asc,currency.asc",
-        },
-    )
-
-    # A bank account may be created with account_type='other' in older versions,
-    # so the reliable rule is to exclude only the physical cash account.
-    cash_names = {"сейф", "каса", "готівка", "наличка"}
-    bank_names = []
-    seen = set()
-    for row in accounts:
-        name = normalize_text(row.get("account_name") or "")
-        if not name or name.lower() in cash_names:
+def _group_visible_balances(chat_id: int, include_cash: bool) -> dict:
+    """Return canonical account -> currency -> non-zero amount."""
+    raw = calculate_cash_balances(chat_id)
+    grouped = {}
+    cash_aliases = {"сейф", "каса", "готівка", "наличка"}
+    for (raw_name, currency), amount in raw.items():
+        amount = Decimal(str(amount))
+        if amount == 0:
             continue
-        if name not in seen:
-            seen.add(name)
-            bank_names.append(name)
+        name = canonical_account_name(raw_name or "Сейф")
+        is_cash = name.lower() in cash_aliases or name == "Сейф"
+        if not include_cash and is_cash:
+            continue
+        display = "Каса" if is_cash else name
+        grouped.setdefault(display, {})[currency] = grouped.setdefault(display, {}).get(currency, Decimal("0")) + amount
+    return grouped
 
-    # Include historical balances even if an old account row is missing or inactive.
-    for name, _currency in balances:
-        if name and name.lower() not in cash_names and name not in seen:
-            seen.add(name)
-            bank_names.append(name)
 
-    if not bank_names:
-        return "💳 <b>Карти та банківські рахунки</b>\n\nБанківських рахунків ще немає."
+
+def source_month_summary(chat_id: int, source: str) -> str:
+    """Monthly revenue by source. Source is analytics only; money remains on its real account."""
+    now = datetime.now(KYIV)
+    month_start = now.replace(day=1).date().isoformat()
+    rows = sb_select("cash_operations", {
+        "select": "operation_date,amount,currency,description,account_name",
+        "telegram_chat_id": f"eq.{chat_id}",
+        "operation_type": "eq.income",
+        "is_cancelled": "eq.false",
+        "operation_date": f"gte.{month_start}",
+        "order": "operation_date.asc,created_at.asc",
+        "limit": "1000",
+    })
+    needle = source.lower()
+    matched = [r for r in rows if needle in (r.get("description") or "").lower()]
+    totals = {}
+    accounts = {}
+    for row in matched:
+        currency = row.get("currency") or "UAH"
+        amount = Decimal(str(row.get("amount") or 0))
+        totals[currency] = totals.get(currency, Decimal("0")) + amount
+        account = canonical_account_name(row.get("account_name") or "Сейф")
+        display = "Каса" if account == "Сейф" else account
+        accounts.setdefault(display, {})[currency] = accounts.setdefault(display, {}).get(currency, Decimal("0")) + amount
+
+    title = source.capitalize()
+    if not matched:
+        return f"📊 <b>{title} — поточний місяць</b>\n\nВиручки ще не записано."
+    lines = [f"📊 <b>{title} — поточний місяць</b>", ""]
+    for currency in ("UAH", "USD", "EUR"):
+        if totals.get(currency):
+            lines.append(f"• {money(totals[currency], currency)}")
+    lines.append("\n<b>Куди зараховано:</b>")
+    for account in sorted(accounts, key=str.lower):
+        values = [money(accounts[account][c], c) for c in ("UAH", "USD", "EUR") if accounts[account].get(c)]
+        lines.append(f"• {account}: " + ", ".join(values))
+    lines.append("\n<i>Базар і Склад — джерела виручки, а не окремі грошові рахунки.</i>")
+    return "\n".join(lines)
+
+
+def cards_summary(chat_id: int) -> str:
+    """Show all bank/card/FOP accounts and only currencies with non-zero balances."""
+    grouped = _group_visible_balances(chat_id, include_cash=False)
+    if not grouped:
+        return "💳 <b>Карти та банківські рахунки</b>\n\nДоступних коштів на банківських рахунках немає."
 
     lines = ["💳 <b>Карти та банківські рахунки</b>"]
     totals = {}
-    for name in sorted(bank_names, key=str.lower):
-        account_balances = []
+    for name in sorted(grouped, key=str.lower):
+        lines.append(f"\n<b>{name}</b>")
         for currency in ("UAH", "USD", "EUR"):
-            amount = balances.get((name, currency), Decimal("0"))
+            amount = grouped[name].get(currency, Decimal("0"))
             if amount != 0:
-                account_balances.append(money(amount, currency))
+                lines.append(f"• {money(amount, currency)}")
                 totals[currency] = totals.get(currency, Decimal("0")) + amount
-        if account_balances:
-            lines.append(f"\n<b>{name}</b>")
-            for value in account_balances:
-                lines.append(f"• {value}")
-        else:
-            lines.append(f"\n<b>{name}</b>\n• 0 грн")
 
     if totals:
         lines.append("\n<b>Разом на всіх банківських рахунках:</b>")
         for currency in ("UAH", "USD", "EUR"):
-            if currency in totals:
-                lines.append(f"• {money(totals[currency], currency)}")
-
+            amount = totals.get(currency, Decimal("0"))
+            if amount != 0:
+                lines.append(f"• {money(amount, currency)}")
     return "\n".join(lines)
 
 
 def cash_summary(chat_id: int) -> str:
-    balances = calculate_cash_balances(chat_id)
+    """Full money picture: physical cash plus every bank account, in every non-zero currency."""
+    grouped = _group_visible_balances(chat_id, include_cash=True)
 
     debts = find_open_debts(chat_id)
     debt_totals = {}
     for debt in debts:
         curr = debt["currency"]
-        debt_totals[curr] = debt_totals.get(curr, Decimal("0")) + Decimal(
-            str(debt["outstanding_amount"])
-        )
+        debt_totals[curr] = debt_totals.get(curr, Decimal("0")) + Decimal(str(debt["outstanding_amount"]))
 
-    lines = ["💰 <b>Фінансовий стан</b>\n"]
-    if balances:
-        lines.append("<b>Доступні гроші:</b>")
-        for (name, curr), amount in sorted(balances.items()):
-            lines.append(f"• {name}: {money(amount, curr)}")
+    lines = ["💰 <b>Повний фінансовий стан</b>"]
+    if grouped:
+        total_all = {}
+        for name in sorted(grouped, key=lambda x: (x != "Каса", x.lower())):
+            lines.append(f"\n<b>{name}</b>")
+            for currency in ("UAH", "USD", "EUR"):
+                amount = grouped[name].get(currency, Decimal("0"))
+                if amount != 0:
+                    lines.append(f"• {money(amount, currency)}")
+                    total_all[currency] = total_all.get(currency, Decimal("0")) + amount
+        if total_all:
+            lines.append("\n<b>Разом доступно на всіх рахунках:</b>")
+            for currency in ("UAH", "USD", "EUR"):
+                amount = total_all.get(currency, Decimal("0"))
+                if amount != 0:
+                    lines.append(f"• {money(amount, currency)}")
     else:
-        lines.append("Грошові залишки ще не внесені.")
+        lines.append("\nГрошові залишки ще не внесені.")
 
     lines.append("\n<b>Нам винні:</b>")
-    if debt_totals:
-        for curr, amount in debt_totals.items():
+    visible_debts = False
+    for curr in ("UAH", "USD", "EUR"):
+        amount = debt_totals.get(curr, Decimal("0"))
+        if amount != 0:
             lines.append(f"• {money(amount, curr)}")
-    else:
+            visible_debts = True
+    if not visible_debts:
         lines.append("• Боргів немає")
-
     return "\n".join(lines)
 
 
@@ -1549,6 +1669,8 @@ def history_text(chat_id: int):
         "income": "Виручка",
         "expense": "Витрата",
         "exchange_in": "Обмін +",
+        "transfer_out": "Переказ −",
+        "transfer_in": "Переказ +",
         "exchange_out": "Обмін −",
     }
     for row in rows:
@@ -1849,6 +1971,10 @@ def text_handler(message):
             bot.reply_to(message, cards_summary(message.chat.id))
             return
 
+        if low in ("базар", "склад"):
+            bot.reply_to(message, source_month_summary(message.chat.id, low))
+            return
+
         if low in ("звіт", "отчет"):
             bot.reply_to(message, report_text(message.chat.id))
             return
@@ -1879,7 +2005,7 @@ def text_handler(message):
             return
 
         # Усі бухгалтерські записи проходять обов'язковий попередній перегляд.
-        write_keywords = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін"}
+        write_keywords = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін", "переказ"}
         if first_keyword(text) in write_keywords:
             offer_direct_confirmation(message, text)
             return
@@ -1891,7 +2017,7 @@ def text_handler(message):
         bot.reply_to(
             message,
             "Не зрозумів перше ключове слово. Дані не записував.\n\n"
-            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, залишок, ревізія, обмін</b>.\n"
+            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, залишок, ревізія, обмін, переказ</b>.\n"
             "Приклад: <code>повернення Болена 2000 грн в касу</code>",
         )
 
