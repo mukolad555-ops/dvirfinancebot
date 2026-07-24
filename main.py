@@ -13,7 +13,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v2.3 — keyword first
+# Dvir Finance Bot v3.1 — mode-based parser + safe AI confirmation
 # Telegram + Supabase
 # ============================================================
 
@@ -36,10 +36,31 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 3.0-HYBRID-CONFIRM-20260724"
+VERSION = "DvirFinance 3.1-MODE-HYBRID-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
-AI_HELP_ENABLED = os.getenv("AI_HELP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# New single mode switch. Preferred Railway variable:
+# DVIRFINANCE_MODE=STRICT | HYBRID | AI
+# MODE is accepted as a shorter alias.
+# Legacy STABLE_LOCAL_ONLY remains supported only when no new mode is set.
+LEGACY_STABLE_LOCAL_ONLY = os.getenv("STABLE_LOCAL_ONLY", "false").lower() in (
+    "1", "true", "yes", "on"
+)
+_mode_raw = (os.getenv("DVIRFINANCE_MODE") or os.getenv("MODE") or "").strip().upper()
+if _mode_raw:
+    APP_MODE = _mode_raw
+else:
+    APP_MODE = "STRICT" if LEGACY_STABLE_LOCAL_ONLY else "HYBRID"
+if APP_MODE not in {"STRICT", "HYBRID", "AI"}:
+    log.warning("Невідомий режим %s; використовую STRICT", APP_MODE)
+    APP_MODE = "STRICT"
+
+# Legacy AI_HELP_ENABLED can still forcibly disable AI, but cannot enable it in STRICT.
+_legacy_ai_enabled = os.getenv("AI_HELP_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on"
+)
+AI_HELP_ENABLED = APP_MODE in {"HYBRID", "AI"} and _legacy_ai_enabled and bool(OPENAI_API_KEY)
 PENDING_AI = {}
 PENDING_TTL_SECONDS = 900
 
@@ -1163,11 +1184,13 @@ def text_handler(message):
 
     try:
         if low in ("версія", "версия", "version"):
+            ai_status = "увімкнено з підтвердженням" if AI_HELP_ENABLED else "вимкнено"
             bot.reply_to(
                 message,
                 f"✅ <b>{VERSION}</b>\n"
-                "Режим: ключове слово першим\n"
-                f"ШІ-помічник: {'увімкнено з підтвердженням' if AI_HELP_ENABLED and OPENAI_API_KEY else 'вимкнено'}\n"
+                f"Режим: <b>{APP_MODE}</b>\n"
+                "Правило: ключове слово першим\n"
+                f"ШІ-помічник: {ai_status}\n"
                 "ШІ самостійно нічого не записує",
             )
             return
@@ -1221,13 +1244,19 @@ def text_handler(message):
             return
         if handle_debt_queries(message, text):
             return
-        # Чіткі локальні правила завжди мають пріоритет.
-        if execute_canonical(message, text):
-            return
-
-        # ШІ лише пропонує канонічну команду; запис — тільки після натискання «Так».
-        if offer_ai_suggestion(message, text):
-            return
+        # STRICT: тільки локальні перевірені правила.
+        # HYBRID: спочатку локальні правила, потім AI-підказка з підтвердженням.
+        # AI: спочатку AI-підказка з підтвердженням; якщо AI не допоміг — локальні правила.
+        if APP_MODE == "AI":
+            if offer_ai_suggestion(message, text):
+                return
+            if execute_canonical(message, text):
+                return
+        else:
+            if execute_canonical(message, text):
+                return
+            if APP_MODE == "HYBRID" and offer_ai_suggestion(message, text):
+                return
 
         bot.reply_to(
             message,
@@ -1252,5 +1281,5 @@ if __name__ == "__main__":
         timeout=30,
         long_polling_timeout=30,
         skip_pending=True,
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
     )
