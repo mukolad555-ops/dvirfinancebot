@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.2-INTEGRATED-CORE-20260724"
+VERSION = "DvirFinance 4.3-FINAL-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -469,8 +469,15 @@ def handle_exchange(message, text: str) -> bool:
             raise ValueError("Вкажи курс. Наприклад: обмін 10000 грн на долари курс 45")
         to_currency = parse_currency(target_match.group("currency"))
         rate = parse_amount(rate_match.group("rate"))
-        # Курс розуміємо як кількість вихідної валюти за 1 одиницю отриманої.
-        to_amount = (from_amount / rate).quantize(Decimal("0.01"))
+        # Напрямок розрахунку залежить від валют:
+        # гривні → іноземна валюта: ділимо на курс;
+        # іноземна валюта → гривні: множимо на курс;
+        # іноземна → іноземна: курс означає кількість цільової валюти
+        # за 1 одиницю вихідної, тому множимо.
+        if from_currency == "UAH" and to_currency != "UAH":
+            to_amount = (from_amount / rate).quantize(Decimal("0.01"))
+        else:
+            to_amount = (from_amount * rate).quantize(Decimal("0.01"))
 
     if from_currency == to_currency:
         raise ValueError("Вихідна й отримана валюти мають бути різними")
