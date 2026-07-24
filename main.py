@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.0-ACCOUNTING-CORE-20260724"
+VERSION = "DvirFinance 4.1-EXCHANGE-FIX-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -398,6 +398,93 @@ def handle_income_expense(message, text: str) -> bool:
     return True
 
 
+# ------------------------ Currency exchange ------------------------
+
+def _currency_word_pattern() -> str:
+    return r"грн|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€"
+
+
+def handle_exchange(message, text: str) -> bool:
+    """Обмін є однією атомарною операцією: мінус вихідної валюти, плюс отриманої."""
+    if first_keyword(text) != "обмін":
+        return False
+
+    tail = keyword_tail(text, "обмін")
+    from_amount, from_currency, first_match = extract_amount_currency(tail)
+    after = tail[first_match.end():].strip()
+
+    # Варіант 1: обмін 10000 грн на 220 доларів
+    explicit_to = re.search(
+        rf"(?:^|\s)на\s+(?P<amount>\d[\d\s]*(?:[.,]\d{{1,2}})?)\s*"
+        rf"(?P<currency>{_currency_word_pattern()})",
+        after,
+        flags=re.IGNORECASE,
+    )
+
+    rate_match = re.search(
+        r"(?:курс|по)\s*(?:по\s*)?(?P<rate>\d[\d\s]*(?:[.,]\d{1,6})?)",
+        after,
+        flags=re.IGNORECASE,
+    )
+
+    if explicit_to:
+        to_amount = parse_amount(explicit_to.group("amount"))
+        to_currency = parse_currency(explicit_to.group("currency"))
+        rate = (from_amount / to_amount).quantize(Decimal("0.000001"))
+    else:
+        target_match = re.search(
+            rf"(?:^|\s)на\s+(?P<currency>{_currency_word_pattern()})",
+            after,
+            flags=re.IGNORECASE,
+        )
+        if not target_match:
+            raise ValueError("Вкажи, на яку валюту міняємо. Наприклад: обмін 10000 грн на долари курс 45")
+        if not rate_match:
+            raise ValueError("Вкажи курс. Наприклад: обмін 10000 грн на долари курс 45")
+        to_currency = parse_currency(target_match.group("currency"))
+        rate = parse_amount(rate_match.group("rate"))
+        # Курс розуміємо як кількість вихідної валюти за 1 одиницю отриманої.
+        to_amount = (from_amount / rate).quantize(Decimal("0.01"))
+
+    if from_currency == to_currency:
+        raise ValueError("Вихідна й отримана валюти мають бути різними")
+
+    account_name, account_type = default_account_name(text)
+    from_account = get_or_create_account(message.chat.id, account_name, from_currency, account_type)
+    to_account = get_or_create_account(message.chat.id, account_name, to_currency, account_type)
+
+    result = sb_rpc("dvirfinance_exchange", {
+        "p_chat_id": message.chat.id,
+        "p_user_id": message.from_user.id,
+        "p_username": message.from_user.username,
+        "p_full_name": user_fields(message)["telegram_full_name"],
+        "p_message_id": message.message_id,
+        "p_operation_date": today_str(),
+        "p_from_amount": float(from_amount),
+        "p_from_currency": from_currency,
+        "p_to_amount": float(to_amount),
+        "p_to_currency": to_currency,
+        "p_rate": float(rate),
+        "p_from_account_id": from_account["id"],
+        "p_from_account_name": account_name,
+        "p_to_account_id": to_account["id"],
+        "p_to_account_name": account_name,
+        "p_description": normalize_text(text),
+    })
+    operation_id = result.get("operation_id") if isinstance(result, dict) else None
+    display_account = "Каса" if account_name == "Сейф" else account_name
+    bot.reply_to(
+        message,
+        "✅ <b>Обмін записано</b>"
+        f"{f' · #{operation_id}' if operation_id else ''}\n\n"
+        f"➖ {money(from_amount, from_currency)}\n"
+        f"➕ <b>{money(to_amount, to_currency)}</b>\n"
+        f"Курс: {rate.normalize()}\n"
+        f"📍 Рахунок: {display_account}",
+    )
+    return True
+
+
 # ------------------------ Revisions ------------------------
 
 def handle_revision(message, text: str) -> bool:
@@ -659,7 +746,7 @@ def handle_debt_payment(message, text: str) -> bool:
 
 # ------------------------ Hybrid AI helper ------------------------
 
-CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія"}
+CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "обмін"}
 
 def canonical_command_is_safe(command: str) -> bool:
     command = normalize_text(command)
@@ -694,6 +781,7 @@ def ai_suggest_canonical(text: str) -> str | None:
 - повернення: зменшити борг клієнта і зарахувати гроші у касу/на рахунок
 - аванс: отриманий аванс, плюс у касу/на рахунок
 - ревізія: фактичний залишок
+- обмін: обмін однієї валюти на іншу з указаним курсом або двома сумами
 
 Правила:
 1) Поверни тільки один рядок без пояснень.
@@ -726,6 +814,7 @@ def cleanup_pending_ai():
 def execute_canonical(message, text: str) -> bool:
     for handler in (
         handle_revision,
+        handle_exchange,
         handle_debt_payment,
         handle_debt_create,
         handle_advance,
@@ -1152,6 +1241,7 @@ def operation_label(row: dict) -> str:
         "transfer": "Переказ",
         "daily_closing": "Закриття дня",
         "reset": "Обнулення",
+        "exchange": "Обмін",
     }
     return labels.get(row.get("entity_type"), row.get("entity_type") or "Операція")
 
@@ -1176,6 +1266,12 @@ def latest_operations_text(chat_id: int, limit: int = 10) -> str:
         currency = summary.get("currency") or "UAH"
         description = summary.get("description") or summary.get("customer_name") or ""
         account = summary.get("account_name") or summary.get("destination_account_name") or ""
+        if row.get("entity_type") == "exchange":
+            description = (
+                f"{money(summary.get('from_amount'), summary.get('from_currency') or 'UAH')} → "
+                f"{money(summary.get('to_amount'), summary.get('to_currency') or 'USD')} · "
+                f"курс {summary.get('rate')}"
+            )
         created = str(row.get("created_at") or "").replace("T", " ")[:16]
         status = " — <b>СКАСОВАНО</b>" if row.get("is_cancelled") else ""
         detail = operation_label(row)
@@ -1361,6 +1457,9 @@ HELP_TEXT = """
 ➕ отриманий аванс у касу
 
 <code>ревізія 125000 грн у касі</code>
+
+<code>обмін 10000 грн на долари курс 45</code>
+💱 мінус гривні та плюс долари однією операцією
 <code>борги</code>
 <code>каса</code>
 <code>звіт</code>
@@ -1450,7 +1549,7 @@ def text_handler(message):
         bot.reply_to(
             message,
             "Не зрозумів перше ключове слово. Дані не записував.\n\n"
-            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, ревізія</b>.\n"
+            "Використовуй: <b>виручка, витрата, борг, повернення, аванс, ревізія, обмін</b>.\n"
             "Приклад: <code>повернення Болена 2000 грн в касу</code>",
         )
 
