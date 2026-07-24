@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 3.1-MODE-HYBRID-20260724"
+VERSION = "DvirFinance 4.0-ACCOUNTING-CORE-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -62,6 +62,7 @@ _legacy_ai_enabled = os.getenv("AI_HELP_ENABLED", "true").lower() in (
 )
 AI_HELP_ENABLED = APP_MODE in {"HYBRID", "AI"} and _legacy_ai_enabled and bool(OPENAI_API_KEY)
 PENDING_AI = {}
+PENDING_ACTIONS = {}
 PENDING_TTL_SECONDS = 900
 
 HEADERS = {
@@ -112,6 +113,16 @@ def sb_insert(table: str, payload):
 
 def sb_update(table: str, params: dict, payload: dict):
     return sb_request("PATCH", table, params=params, json=payload)
+
+
+def sb_rpc(function_name: str, payload: dict):
+    """Call a Supabase PostgreSQL function. Critical accounting changes live in DB transactions."""
+    url = f"{SUPABASE_URL}/rest/v1/rpc/{function_name}"
+    response = requests.post(url, headers=HEADERS, json=payload, timeout=30)
+    if not response.ok:
+        log.error("Supabase RPC %s: %s", function_name, response.text)
+        raise RuntimeError(response.text)
+    return response.json() if response.text else None
 
 
 # ------------------------ Helpers ------------------------
@@ -937,6 +948,7 @@ def latest_revisions(chat_id: int):
         {
             "select": "*",
             "telegram_chat_id": f"eq.{chat_id}",
+            "is_cancelled": "eq.false",
             "order": "revision_date.desc,created_at.desc",
         },
     )
@@ -1128,6 +1140,201 @@ def history_text(chat_id: int):
     return "\n".join(lines)
 
 
+
+# ------------------------ Reliable accounting core ------------------------
+
+def operation_label(row: dict) -> str:
+    labels = {
+        "cash_operation": "Грошова операція",
+        "debt": "Борг",
+        "debt_payment": "Повернення боргу",
+        "revision": "Ревізія",
+        "transfer": "Переказ",
+        "daily_closing": "Закриття дня",
+        "reset": "Обнулення",
+    }
+    return labels.get(row.get("entity_type"), row.get("entity_type") or "Операція")
+
+
+def latest_operations_text(chat_id: int, limit: int = 10) -> str:
+    limit = max(1, min(int(limit), 30))
+    rows = sb_select(
+        "accounting_operations",
+        {
+            "select": "id,created_at,entity_type,summary,is_cancelled,cancelled_at",
+            "telegram_chat_id": f"eq.{chat_id}",
+            "order": "id.desc",
+            "limit": str(limit),
+        },
+    )
+    if not rows:
+        return "Історія операцій поки порожня."
+    lines = ["🕘 <b>Останні операції</b>\n"]
+    for row in rows:
+        summary = row.get("summary") or {}
+        amount = summary.get("amount")
+        currency = summary.get("currency") or "UAH"
+        description = summary.get("description") or summary.get("customer_name") or ""
+        account = summary.get("account_name") or summary.get("destination_account_name") or ""
+        created = str(row.get("created_at") or "").replace("T", " ")[:16]
+        status = " — <b>СКАСОВАНО</b>" if row.get("is_cancelled") else ""
+        detail = operation_label(row)
+        if amount is not None:
+            detail += f" · {money(amount, currency)}"
+        if description:
+            detail += f" · {description}"
+        if account:
+            detail += f" → {'Каса' if account == 'Сейф' else account}"
+        lines.append(f"<b>#{row['id']}</b>{status}\n{created} · {detail}")
+    return "\n\n".join(lines)
+
+
+def find_operation(chat_id: int, operation_id: int | None = None):
+    params = {
+        "select": "id,created_at,entity_type,summary,is_cancelled,cancelled_at",
+        "telegram_chat_id": f"eq.{chat_id}",
+        "order": "id.desc",
+        "limit": "1",
+    }
+    if operation_id is not None:
+        params["id"] = f"eq.{operation_id}"
+    else:
+        params["is_cancelled"] = "eq.false"
+    rows = sb_select("accounting_operations", params)
+    return rows[0] if rows else None
+
+
+def cleanup_pending_actions():
+    cutoff = time.time() - PENDING_TTL_SECONDS
+    for key in list(PENDING_ACTIONS):
+        if PENDING_ACTIONS[key].get("created", 0) < cutoff:
+            PENDING_ACTIONS.pop(key, None)
+
+
+def request_cancel(message, operation_id: int | None = None):
+    row = find_operation(message.chat.id, operation_id)
+    if not row:
+        bot.reply_to(message, "Не знайшов активну операцію для скасування.")
+        return
+    if row.get("is_cancelled"):
+        bot.reply_to(message, f"Операція #{row['id']} вже скасована.")
+        return
+    token = uuid.uuid4().hex[:12]
+    cleanup_pending_actions()
+    PENDING_ACTIONS[token] = {
+        "kind": "cancel",
+        "created": time.time(),
+        "chat_id": message.chat.id,
+        "user_id": message.from_user.id,
+        "operation_id": row["id"],
+    }
+    summary = row.get("summary") or {}
+    detail = operation_label(row)
+    if summary.get("amount") is not None:
+        detail += f" — {money(summary['amount'], summary.get('currency') or 'UAH')}"
+    if summary.get("description") or summary.get("customer_name"):
+        detail += f"\n{summary.get('description') or summary.get('customer_name')}"
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("✅ Підтвердити скасування", callback_data=f"cancel_yes:{token}"),
+        telebot.types.InlineKeyboardButton("❌ Відміна", callback_data=f"cancel_no:{token}"),
+    )
+    bot.reply_to(message, f"Скасувати операцію <b>#{row['id']}</b>?\n\n{detail}\n\nСтан бази буде повернуто так, ніби операції не було.", reply_markup=markup)
+
+
+def request_reset(message):
+    token = uuid.uuid4().hex[:12]
+    cleanup_pending_actions()
+    PENDING_ACTIONS[token] = {
+        "kind": "reset_stage1",
+        "created": time.time(),
+        "chat_id": message.chat.id,
+        "user_id": message.from_user.id,
+    }
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.row(
+        telebot.types.InlineKeyboardButton("⚠️ Так, продовжити", callback_data=f"reset_yes:{token}"),
+        telebot.types.InlineKeyboardButton("❌ Відміна", callback_data=f"reset_no:{token}"),
+    )
+    bot.reply_to(
+        message,
+        "⚠️ <b>Обнулити облік?</b>\n\nБудуть обнулені рахунки, активні борги, аванси й перекази. Історія залишиться.\n\nЦе перше підтвердження.",
+        reply_markup=markup,
+    )
+
+
+def finish_reset_if_expected(message, text: str) -> bool:
+    cleanup_pending_actions()
+    candidates = [
+        (token, data) for token, data in PENDING_ACTIONS.items()
+        if data.get("kind") == "reset_stage2"
+        and data.get("chat_id") == message.chat.id
+        and data.get("user_id") == message.from_user.id
+    ]
+    if not candidates:
+        return False
+    token, pending = max(candidates, key=lambda item: item[1]["created"])
+    if text != "ОБНУЛИТИ":
+        bot.reply_to(message, "Для другого підтвердження потрібно написати точно: <code>ОБНУЛИТИ</code>")
+        return True
+    result = sb_rpc("dvirfinance_reset", {
+        "p_chat_id": message.chat.id,
+        "p_user_id": message.from_user.id,
+        "p_reason": "Подвійне підтвердження в Telegram",
+    })
+    PENDING_ACTIONS.pop(token, None)
+    op_id = result.get("operation_id") if isinstance(result, dict) else None
+    bot.reply_to(message, f"✅ Облік обнулено. Історія збережена.{f' Операція #{op_id}.' if op_id else ''}")
+    return True
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("cancel_yes:", "cancel_no:", "reset_yes:", "reset_no:")))
+def accounting_confirmation_handler(call):
+    cleanup_pending_actions()
+    action, token = call.data.split(":", 1)
+    pending = PENDING_ACTIONS.get(token)
+    if not pending or pending.get("chat_id") != call.message.chat.id:
+        bot.answer_callback_query(call.id, "Підтвердження застаріло")
+        return
+    if pending.get("user_id") != call.from_user.id:
+        bot.answer_callback_query(call.id, "Підтвердити може лише автор команди")
+        return
+    if action in ("cancel_no", "reset_no"):
+        PENDING_ACTIONS.pop(token, None)
+        bot.answer_callback_query(call.id, "Скасовано")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        return
+    if action == "cancel_yes":
+        try:
+            result = sb_rpc("dvirfinance_cancel_operation", {
+                "p_chat_id": call.message.chat.id,
+                "p_operation_id": pending["operation_id"],
+                "p_user_id": call.from_user.id,
+                "p_reason": "Скасовано через Telegram",
+            })
+            PENDING_ACTIONS.pop(token, None)
+            bot.answer_callback_query(call.id, "Операцію скасовано")
+            bot.edit_message_text(
+                f"✅ Операцію <b>#{pending['operation_id']}</b> скасовано.\nСтан бази відновлено.",
+                call.message.chat.id,
+                call.message.message_id,
+            )
+        except Exception as exc:
+            log.exception("Cancellation failed")
+            bot.answer_callback_query(call.id, "Скасування не виконано")
+            bot.send_message(call.message.chat.id, f"⚠️ Операцію не скасовано. База не змінена.\n<code>{str(exc)[:300]}</code>")
+        return
+    if action == "reset_yes":
+        pending["kind"] = "reset_stage2"
+        pending["created"] = time.time()
+        bot.answer_callback_query(call.id, "Перше підтвердження прийнято")
+        bot.edit_message_text(
+            "⚠️ <b>ОСТАТОЧНЕ ПІДТВЕРДЖЕННЯ</b>\n\nНапишіть точно великими літерами:\n<code>ОБНУЛИТИ</code>\n\nКоманда діє 15 хвилин.",
+            call.message.chat.id,
+            call.message.message_id,
+        )
+
+
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
@@ -1157,8 +1364,10 @@ HELP_TEXT = """
 <code>борги</code>
 <code>каса</code>
 <code>звіт</code>
-<code>історія</code>
-<code>видалити останню</code>
+<code>останні</code>
+<code>скасувати</code>
+<code>скасувати #127</code>
+<code>обнулити</code>
 <code>версія</code>
 """.strip()
 
@@ -1203,43 +1412,23 @@ def text_handler(message):
             bot.reply_to(message, report_text(message.chat.id))
             return
 
-        if low in ("історія", "история"):
-            bot.reply_to(message, history_text(message.chat.id))
+        if finish_reset_if_expected(message, text):
             return
 
-        if low in ("видалити останню", "удалить последнюю"):
-            rows = sb_select(
-                "cash_operations",
-                {
-                    "select": "*",
-                    "telegram_chat_id": f"eq.{message.chat.id}",
-                    "is_cancelled": "eq.false",
-                    "order": "created_at.desc",
-                    "limit": "1",
-                },
-            )
-            if not rows:
-                bot.reply_to(message, "Немає операції для видалення.")
-                return
-            row = rows[0]
-            sb_update(
-                "cash_operations",
-                {"id": f"eq.{row['id']}"},
-                {
-                    "is_cancelled": True,
-                    "cancelled_at": datetime.now(KYIV).isoformat(),
-                    "cancellation_reason": f"Скасовано користувачем {message.from_user.id}",
-                },
-            )
-            bot.reply_to(
-                message,
-                f"✅ Останню операцію скасовано: "
-                f"{money(row['amount'], row['currency'])}",
-            )
+        latest_match = re.fullmatch(r"(?:останні|історія)(?:\s+(\d{1,2}))?", low)
+        if latest_match:
+            bot.reply_to(message, latest_operations_text(message.chat.id, int(latest_match.group(1) or 10)))
             return
 
-        if handle_daily_closing(message, text):
+        cancel_match = re.fullmatch(r"скасувати(?:\s+#?(\d+))?", low)
+        if cancel_match:
+            request_cancel(message, int(cancel_match.group(1)) if cancel_match.group(1) else None)
             return
+
+        if low == "обнулити":
+            request_reset(message)
+            return
+
         if handle_revision(message, text):
             return
         if handle_debt_queries(message, text):
