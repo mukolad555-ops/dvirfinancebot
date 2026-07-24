@@ -36,9 +36,13 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 5.0-TESTED-CORE-20260724"
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+VERSION = "DvirFinance 5.2-AI-FULL-20260724"
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
+OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
+OPENAI_ORG = (os.getenv("OPENAI_ORG") or os.getenv("OPENAI_ORGANIZATION") or "").strip()
+AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "30"))
+AI_MAX_OPTIONS = max(1, min(3, int(os.getenv("AI_MAX_OPTIONS", "3"))))
 
 # New single mode switch. Preferred Railway variable:
 # DVIRFINANCE_MODE=STRICT | HYBRID | AI
@@ -51,7 +55,9 @@ _mode_raw = (os.getenv("DVIRFINANCE_MODE") or os.getenv("MODE") or "").strip().u
 if _mode_raw:
     APP_MODE = _mode_raw
 else:
-    APP_MODE = "STRICT" if LEGACY_STABLE_LOCAL_ONLY else "HYBRID"
+    # Старий STABLE_LOCAL_ONLY більше не вимикає вже підключений ШІ.
+    # Якщо ключ є — автоматично працюємо в HYBRID; без ключа — STRICT.
+    APP_MODE = "HYBRID" if OPENAI_API_KEY else "STRICT"
 if APP_MODE not in {"STRICT", "HYBRID", "AI"}:
     log.warning("Невідомий режим %s; використовую STRICT", APP_MODE)
     APP_MODE = "STRICT"
@@ -999,7 +1005,129 @@ def handle_debt_payment(message, text: str) -> bool:
 
 # ------------------------ Hybrid AI helper ------------------------
 
-CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "обмін", "переказ"}
+CANONICAL_KEYWORDS = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін", "переказ"}
+
+
+
+def local_normalize_command(text: str) -> str:
+    """Cheap deterministic normalization before AI: preserve first-word intent and fix common forms."""
+    command = normalize_text(text)
+    if not command:
+        return command
+    first, *rest = command.split(" ", 1)
+    aliases = {
+        "витрати": "витрата",
+        "виручки": "виручка",
+        "перекинути": "переказ",
+        "перекинув": "переказ",
+        "перевести": "переказ",
+        "перевів": "переказ",
+    }
+    first = aliases.get(first.lower(), first.lower())
+    tail = rest[0] if rest else ""
+    tail = re.sub(r"(?<=\d)\s*гр\b", " грн", tail, flags=re.IGNORECASE)
+    tail = re.sub(r"\bкарточк(?:а|и|у|ою|е|ой)\b", "картка", tail, flags=re.IGNORECASE)
+    tail = re.sub(r"\bкарти\b", "картки", tail, flags=re.IGNORECASE)
+    tail = re.sub(r"\bпівденн(?:ій|ьому|ого|им)\b", "Південний", tail, flags=re.IGNORECASE)
+    return normalize_text(f"{first} {tail}")
+
+
+def openai_headers() -> dict:
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    if OPENAI_PROJECT:
+        headers["OpenAI-Project"] = OPENAI_PROJECT
+    if OPENAI_ORG:
+        headers["OpenAI-Organization"] = OPENAI_ORG
+    return headers
+
+
+def _openai_response(prompt: str, max_output_tokens: int = 220) -> tuple[str | None, str | None]:
+    """Call Responses API with safe model fallback. Returns (text, error)."""
+    if not OPENAI_API_KEY:
+        return None, "OPENAI_API_KEY не знайдено"
+    models = []
+    for model in (OPENAI_MODEL, "gpt-5-mini", "gpt-4.1-mini"):
+        if model and model not in models:
+            models.append(model)
+    last_error = None
+    for model in models:
+        try:
+            response = requests.post(
+                "https://api.openai.com/v1/responses",
+                headers=openai_headers(),
+                json={
+                    "model": model,
+                    "input": prompt,
+                    "store": False,
+                    "max_output_tokens": max_output_tokens,
+                },
+                timeout=AI_TIMEOUT_SECONDS,
+            )
+            if response.ok:
+                text = extract_openai_text(response.json()).strip()
+                if text:
+                    return text, None
+                last_error = f"{model}: порожня відповідь"
+                continue
+            body = response.text[:500]
+            last_error = f"{model}: HTTP {response.status_code} {body}"
+            # 401/403 — інша модель не допоможе.
+            if response.status_code in (401, 403):
+                break
+        except Exception as exc:
+            last_error = f"{model}: {exc}"
+    log.warning("OpenAI call failed: %s", last_error)
+    return None, last_error
+
+
+def ai_live_status() -> tuple[bool, str]:
+    if not OPENAI_API_KEY:
+        return False, "ключ не знайдено"
+    text, error = _openai_response('Поверни тільки слово OK', max_output_tokens=12)
+    if text and text.strip().upper().startswith("OK"):
+        return True, "зв’язок працює"
+    return False, error or "немає коректної відповіді"
+
+
+def ai_suggest_options(text: str) -> list[str]:
+    """Return 1-3 safe canonical interpretations. AI never writes; user chooses one."""
+    base = local_normalize_command(text)
+    if not AI_HELP_ENABLED or not OPENAI_API_KEY:
+        return [base] if canonical_command_is_safe(base) else []
+    prompt = f"""Ти розбираєш бухгалтерське повідомлення DvirFinance. Перше слово задає дію і його не можна змінювати, крім форми «витрати» -> «витрата».
+Поверни JSON-масив від 1 до 3 канонічних команд без пояснень.
+Ключові слова: виручка, витрата, борг, повернення, аванс, ревізія, залишок, обмін, переказ.
+Рахунки: Каса, Картка Миколи, Картка Андрія, Приват Миколи, Приват Андрія, ФОП Миколи, ФОП Андрія, Південний Миколи, Південний Андрія.
+«Південний», «Південний банк», «банк Південний» означають один банк. «з карти/картки» означає рахунок списання; «на карту/картку» — рахунок зарахування.
+Не вигадуй суму, валюту, власника чи призначення. Якщо власник/рахунок неоднозначний, дай кілька варіантів. Якщо валюта відсутня — грн.
+Для переказу форма: переказ 5000 грн з Картки Андрія на Касу.
+Для витрати форма: витрата 5000 грн Південний Андрія призначення.
+Повідомлення: {base}"""
+    try:
+        raw_text, api_error = _openai_response(prompt, max_output_tokens=260)
+        if not raw_text:
+            log.warning("OpenAI options error: %s", api_error)
+            return [base] if canonical_command_is_safe(base) else []
+        raw = raw_text.strip().strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        data = json.loads(raw)
+        if not isinstance(data, list):
+            data = [data]
+        out=[]
+        expected=first_keyword(base)
+        for item in data[:AI_MAX_OPTIONS]:
+            if not isinstance(item,str):
+                continue
+            cmd=local_normalize_command(item)
+            if expected == "витрата" and first_keyword(cmd) != "витрата":
+                continue
+            if canonical_command_is_safe(cmd) and cmd not in out:
+                out.append(cmd)
+        return out or ([base] if canonical_command_is_safe(base) else [])
+    except Exception:
+        log.exception("AI options normalization failed")
+        return [base] if canonical_command_is_safe(base) else []
 
 def canonical_command_is_safe(command: str) -> bool:
     command = normalize_text(command)
@@ -1048,16 +1176,11 @@ def ai_suggest_canonical(text: str) -> str | None:
 5) Якщо неможливо однозначно зрозуміти, поверни НЕЗРОЗУМІЛО.
 
 Повідомлення: {text}"""
-    response = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json={"model": OPENAI_MODEL, "input": prompt, "store": False, "max_output_tokens": 100},
-        timeout=20,
-    )
-    if not response.ok:
-        log.warning("OpenAI helper error: %s", response.text[:500])
+    raw_text, api_error = _openai_response(prompt, max_output_tokens=140)
+    if not raw_text:
+        log.warning("OpenAI helper error: %s", api_error)
         return None
-    suggestion = extract_openai_text(response.json()).splitlines()[0].strip().strip("`\"")
+    suggestion = raw_text.splitlines()[0].strip().strip("`\"")
     if suggestion.upper().startswith("НЕЗРОЗУМІЛО") or not canonical_command_is_safe(suggestion):
         return None
     return suggestion
@@ -1071,52 +1194,49 @@ def cleanup_pending_direct():
 
 
 def offer_direct_confirmation(message, original_text: str) -> bool:
-    """Show a mandatory preview before any bookkeeping write. Nothing is saved here."""
+    """Show one or several interpretations. Nothing is saved before an explicit choice."""
     cleanup_pending_direct()
-    suggestion = original_text
-    if AI_HELP_ENABLED:
-        try:
-            ai_suggestion = ai_suggest_canonical(original_text)
-            if ai_suggestion:
-                suggestion = ai_suggestion
-        except Exception:
-            log.exception("AI normalization failed; using original command")
+    options = ai_suggest_options(original_text) if AI_HELP_ENABLED else []
+    if not options:
+        normalized = local_normalize_command(original_text)
+        options = [normalized] if canonical_command_is_safe(normalized) else []
+    if not options:
+        return False
 
     token = uuid.uuid4().hex[:12]
     PENDING_DIRECT[token] = {
-        "created": time.time(),
-        "chat_id": message.chat.id,
-        "user_id": message.from_user.id,
-        "message_id": message.message_id,
-        "suggestion": suggestion,
-        "original": original_text,
-        "user": {
-            "id": message.from_user.id,
-            "username": message.from_user.username,
-            "first_name": message.from_user.first_name,
-            "last_name": message.from_user.last_name,
-        },
+        "created": time.time(), "chat_id": message.chat.id, "user_id": message.from_user.id,
+        "message_id": message.message_id, "options": options, "original": original_text,
+        "user": {"id": message.from_user.id, "username": message.from_user.username,
+                 "first_name": message.from_user.first_name, "last_name": message.from_user.last_name},
     }
     markup = telebot.types.InlineKeyboardMarkup()
-    markup.row(
-        telebot.types.InlineKeyboardButton("✅ Підтвердити", callback_data=f"direct_yes:{token}"),
-        telebot.types.InlineKeyboardButton("❌ Скасувати", callback_data=f"direct_no:{token}"),
-    )
-    preview = expense_preview_text(suggestion) if first_keyword(suggestion) == "витрата" else (
-        "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{suggestion}</code>" + "\n\nНічого ще не записано."
-    )
-    bot.reply_to(
-        message,
-        preview + "\n\nПідтвердити цю операцію?",
-        reply_markup=markup,
-    )
+    if len(options) == 1:
+        markup.row(
+            telebot.types.InlineKeyboardButton("✅ Підтвердити", callback_data=f"direct_pick:{token}:0"),
+            telebot.types.InlineKeyboardButton("❌ Скасувати", callback_data=f"direct_no:{token}"),
+        )
+        suggestion=options[0]
+        preview = expense_preview_text(suggestion) if first_keyword(suggestion) == "витрата" else (
+            "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{suggestion}</code>" + "\n\nНічого ще не записано."
+        )
+        bot.reply_to(message, preview + "\n\nПідтвердити цю операцію?", reply_markup=markup)
+    else:
+        lines=["🤖 <b>Я бачу кілька можливих варіантів</b>", "", "Нічого ще не записано."]
+        for idx,cmd in enumerate(options,1):
+            lines.append(f"\n<b>{idx}.</b> <code>{cmd}</code>")
+            markup.row(telebot.types.InlineKeyboardButton(f"✅ Варіант {idx}", callback_data=f"direct_pick:{token}:{idx-1}"))
+        markup.row(telebot.types.InlineKeyboardButton("❌ Скасувати", callback_data=f"direct_no:{token}"))
+        bot.reply_to(message, "\n".join(lines), reply_markup=markup)
     return True
 
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("direct_yes:", "direct_no:")))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("direct_pick:", "direct_no:")))
 def direct_confirmation_handler(call):
     cleanup_pending_direct()
-    action, token = call.data.split(":", 1)
+    parts = call.data.split(":")
+    action, token = parts[0], parts[1]
+    option_index = int(parts[2]) if action == "direct_pick" and len(parts) > 2 else None
     pending = PENDING_DIRECT.get(token)
     if not pending or pending["chat_id"] != call.message.chat.id:
         bot.answer_callback_query(call.id, "Підтвердження застаріло")
@@ -1136,10 +1256,11 @@ def direct_confirmation_handler(call):
         chat=call.message.chat,
         from_user=SimpleNamespace(**u),
         message_id=pending["message_id"],
-        text=pending["suggestion"],
+        text=pending["options"][option_index],
     )
     try:
-        if execute_canonical(fake_message, pending["suggestion"]):
+        selected = pending["options"][option_index]
+        if execute_canonical(fake_message, selected):
             bot.answer_callback_query(call.id, "Операцію записано")
         else:
             bot.answer_callback_query(call.id, "Не вдалося розпізнати операцію")
@@ -1951,6 +2072,21 @@ def text_handler(message):
     low = text.lower()
 
     try:
+        if low in ("ші", "ai", "штучний інтелект", "перевірити ші"):
+            ok, detail = ai_live_status()
+            key_status = "є" if OPENAI_API_KEY else "немає"
+            bot.reply_to(
+                message,
+                f"🧠 <b>Перевірка ШІ</b>\n"
+                f"Ключ: <b>{key_status}</b>\n"
+                f"Режим: <b>{APP_MODE}</b>\n"
+                f"Модель: <b>{OPENAI_MODEL}</b>\n"
+                f"AI_HELP_ENABLED: <b>{AI_HELP_ENABLED}</b>\n"
+                f"Статус: <b>{'✅ працює' if ok else '❌ не працює'}</b>\n"
+                f"Деталі: <code>{str(detail)[:350]}</code>",
+            )
+            return
+
         if low in ("версія", "версия", "version"):
             ai_status = "увімкнено з підтвердженням" if AI_HELP_ENABLED else "вимкнено"
             bot.reply_to(
@@ -1959,6 +2095,8 @@ def text_handler(message):
                 f"Режим: <b>{APP_MODE}</b>\n"
                 "Правило: ключове слово першим\n"
                 f"ШІ-помічник: {ai_status}\n"
+                f"Модель: <b>{OPENAI_MODEL}</b>\n"
+                f"Ключ API: <b>{'знайдено' if OPENAI_API_KEY else 'не знайдено'}</b>\n"
                 "ШІ самостійно нічого не записує",
             )
             return
@@ -1980,7 +2118,7 @@ def text_handler(message):
             return
 
         expense_match = re.fullmatch(r"витрати(?:\s+(.+))?", low)
-        if expense_match:
+        if expense_match and not re.search(r"\d", low):
             bot.reply_to(message, expense_report_text(message.chat.id, expense_match.group(1)))
             return
 
@@ -2005,10 +2143,10 @@ def text_handler(message):
             return
 
         # Усі бухгалтерські записи проходять обов'язковий попередній перегляд.
-        write_keywords = {"виручка", "витрата", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін", "переказ"}
+        write_keywords = {"виручка", "витрата", "витрати", "борг", "повернення", "аванс", "ревізія", "залишок", "обмін", "переказ"}
         if first_keyword(text) in write_keywords:
-            offer_direct_confirmation(message, text)
-            return
+            if offer_direct_confirmation(message, text):
+                return
 
         # Для фраз із помилками ШІ лише пропонує безпечну канонічну команду.
         if APP_MODE in ("AI", "HYBRID") and offer_ai_suggestion(message, text):
