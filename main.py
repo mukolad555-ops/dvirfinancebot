@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 4.1-EXCHANGE-FIX-20260724"
+VERSION = "DvirFinance 4.2-INTEGRATED-CORE-20260724"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
@@ -360,41 +360,67 @@ def add_cash_operation(
     )
 
 
+def extract_all_amounts_currency(text: str):
+    """Read every explicit amount+currency pair, including compact input: 300$,250€."""
+    pattern = re.compile(
+        r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
+        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
+        r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
+        flags=re.IGNORECASE,
+    )
+    result = []
+    for match in pattern.finditer(text):
+        result.append((parse_amount(match.group("amount")), parse_currency(match.group("currency")), match))
+    if not result:
+        # Keep the established default: a number without currency means UAH.
+        amount, currency, match = extract_amount_currency(text)
+        result.append((amount, currency, match))
+    return result
+
+
 def handle_income_expense(message, text: str) -> bool:
     keyword = first_keyword(text)
     if keyword not in ("виручка", "витрата"):
         return False
 
     tail = keyword_tail(text, keyword)
-    amount, currency, match = extract_amount_currency(tail)
-    description = description_around_amount(
-        tail, match, "Виручка" if keyword == "виручка" else "Витрата"
-    )
-
-    # Виручка без зазначеного рахунку завжди йде в касу.
+    amounts = extract_all_amounts_currency(tail)
     account_name, _ = default_account_name(text)
     operation_type = "income" if keyword == "виручка" else "expense"
-    add_cash_operation(
-        message, operation_type, amount, currency, description, account_name=account_name
-    )
-    display_account = "Каса" if account_name == "Сейф" else account_name
+    operation_group = str(uuid.uuid4())
 
-    if keyword == "виручка":
-        bot.reply_to(
-            message,
-            f"✅ Виручку записано\n\n"
-            f"➕ <b>{money(amount, currency)}</b>\n"
-            f"📍 Зараховано: {display_account}\n"
-            f"📝 {description}",
+    # Remove all parsed sums from the note so a second currency is never silently left as text.
+    description = tail
+    for _, _, match in reversed(amounts):
+        description = description[:match.start()] + " " + description[match.end():]
+    description = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", description))
+    if not description:
+        description = "Виручка" if keyword == "виручка" else "Витрата"
+
+    payloads = []
+    for amount, currency, _ in amounts:
+        payload = operation_payload(
+            message, operation_type, amount, currency, description, account_name=account_name
         )
-    else:
-        bot.reply_to(
-            message,
-            f"✅ Витрату записано\n\n"
-            f"➖ <b>{money(amount, currency)}</b>\n"
-            f"📍 Списано: {display_account}\n"
-            f"📝 {description}",
-        )
+        payload["operation_group"] = operation_group
+        payloads.append(payload)
+
+    # PostgREST inserts the whole JSON array in one database transaction.
+    sb_insert("cash_operations", payloads)
+
+    display_account = "Каса" if account_name == "Сейф" else account_name
+    sign = "➕" if keyword == "виручка" else "➖"
+    amounts_text = "\n".join(
+        f"{sign} <b>{money(amount, currency)}</b>" for amount, currency, _ in amounts
+    )
+    title = "✅ Виручку записано" if keyword == "виручка" else "✅ Витрату записано"
+    account_line = "Зараховано" if keyword == "виручка" else "Списано"
+    bot.reply_to(
+        message,
+        f"{title}\n\n{amounts_text}\n"
+        f"📍 {account_line}: {display_account}\n"
+        f"📝 {description}",
+    )
     return True
 
 
