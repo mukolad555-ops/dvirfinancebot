@@ -10,7 +10,7 @@ import requests
 import telebot
 
 # ============================================================
-# Dvir Finance Bot v2.1 Parser
+# Dvir Finance Bot v2.2
 # Telegram + Supabase
 # ============================================================
 
@@ -33,6 +33,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
+VERSION = "DvirFinance 2.2-STABLE-20260724"
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -42,7 +43,7 @@ HEADERS = {
 }
 
 CURRENCY_ALIASES = {
-    "грн": "UAH", "гр": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
+    "грн": "UAH", "uah": "UAH", "₴": "UAH", "гривень": "UAH",
     "гривні": "UAH", "гривня": "UAH",
     "дол": "USD", "долар": "USD", "долари": "USD", "доларів": "USD",
     "usd": "USD", "$": "USD",
@@ -50,8 +51,6 @@ CURRENCY_ALIASES = {
 }
 
 CURRENCY_SYMBOLS = {"UAH": "грн", "USD": "$", "EUR": "€"}
-
-VERSION = "DvirFinance 2.1-PARSER-20260724"
 
 
 # ------------------------ Supabase ------------------------
@@ -136,7 +135,7 @@ def money(value, currency: str) -> str:
 def extract_amount_currency(text: str):
     pattern = (
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>грн|гривень|гривні|гривня|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?"
     )
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -147,59 +146,6 @@ def extract_amount_currency(text: str):
         parse_currency(match.group("currency")),
         match,
     )
-
-
-def extract_all_amounts(text: str):
-    """Повертає всі суми з валютами у порядку появи."""
-    pattern = re.compile(
-        r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гривень|гривні|гривня|гр|uah|₴|"
-        r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?",
-        flags=re.IGNORECASE,
-    )
-    result = []
-    for match in pattern.finditer(text):
-        raw_currency = match.group("currency")
-        # Голі числа в описі не приймаємо як гроші, крім одного числа у всій фразі.
-        if not raw_currency and len(list(re.finditer(r"\d+", text))) > 1:
-            continue
-        result.append((parse_amount(match.group("amount")), parse_currency(raw_currency), match))
-    if not result:
-        raise ValueError("Не бачу суму")
-    return result
-
-
-def remove_amounts_and_accounts(text: str) -> str:
-    """Залишає людський опис після вилучення сум, валют та службових слів рахунку."""
-    cleaned = re.sub(
-        r"\d[\d\s]*(?:[.,]\d{1,2})?\s*(?:грн|гривень|гривні|гривня|гр|uah|₴|"
-        r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?",
-        " ", text, flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r"\b(?:на|у|в|до|з|із)?\s*(?:карт(?:у|ку|а|ка|ці)|карточк(?:у|а|и))\s+"
-        r"(?:миколи|миколы|андрія|андрия|андрея)\b",
-        " ", cleaned, flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"\b(?:у|в|на)\s+(?:касу|касі|сейф)\b", " ", cleaned, flags=re.IGNORECASE)
-    return normalize_text(cleaned).strip(" -,:;")
-
-
-def canonical_customer_name(value: str) -> str:
-    return normalize_text(value).strip(" -,:;")
-
-
-def find_customer_from_transfer_text(text: str) -> str | None:
-    """У фразі 'Болена на карту Миколи 2000 грн' повертає 'Болена'."""
-    match = re.search(
-        r"^(?P<customer>.+?)\s+(?:скинув|скинула|переказав|переказала|перевів|перевела)?\s*"
-        r"(?:на|у|в)\s+(?:карт(?:у|ку|а|ка)|карточк(?:у|а))\b",
-        normalize_text(text), flags=re.IGNORECASE,
-    )
-    if not match:
-        return None
-    customer = canonical_customer_name(match.group("customer"))
-    return customer or None
 
 
 def get_or_create_account(chat_id: int, account_name: str, currency: str, account_type="other"):
@@ -231,44 +177,25 @@ def get_or_create_account(chat_id: int, account_name: str, currency: str, accoun
 
 
 def default_account_name(text: str) -> tuple[str, str]:
-    """Визначає рахунок з довільної фрази, не захоплюючи суму в назву."""
-    low = normalize_text(text).lower()
-
-    if any(word in low for word in ("каса", "касу", "касі", "сейф", "готів", "налич")):
+    low = text.lower()
+    # У базі історично рахунок готівки має назву "Сейф".
+    # Слова "каса", "готівка", "наличка" ведуть на той самий рахунок,
+    # щоб не розділити старий і новий баланс на два рахунки.
+    if (
+        "сейф" in low
+        or "кас" in low
+        or "готів" in low
+        or "налич" in low
+    ):
         return "Сейф", "safe"
 
-    # Спочатку конкретні власники — це найнадійніше для коротких фраз.
-    if re.search(r"\b(?:карт(?:а|у|ка|ку|ці|ою)|карточк(?:а|у|и|ою))\s+микол", low):
-        return "Картка Миколи", "personal_card"
-    if re.search(r"\b(?:карт(?:а|у|ка|ку|ці|ою)|карточк(?:а|у|и|ою))\s+андр", low):
-        return "Картка Андрія", "personal_card"
-
-    if "фоп" in low and "микол" in low:
-        return "ФОП Миколи", "fop_card"
-    if "фоп" in low and "андр" in low:
-        return "ФОП Андрія", "fop_card"
-
-    if "півден" in low and "микол" in low:
-        return "Банк Південний Миколи", "bank"
-    if "півден" in low and "андр" in low:
-        return "Банк Південний Андрія", "bank"
-
-    if "приват" in low and "микол" in low:
-        return "ПриватБанк Миколи", "bank"
-    if "приват" in low and "андр" in low:
-        return "ПриватБанк Андрія", "bank"
-
-    # Довільна картка: власник закінчується перед сумою або кінцем рядка.
     card_match = re.search(
-        r"(?:на|у|в|до)?\s*(?:особисту\s+|фоп(?:івську)?\s+)?"
-        r"(?:карт(?:ку|ці|ка|у)|карточк(?:у|а|и))\s+"
-        r"(?P<owner>[а-яіїєґa-z'’.-]+(?:\s+[а-яіїєґa-z'’.-]+){0,2})"
-        r"(?=\s+\d|\s*$)",
-        low,
+        r"(?:на|у|в)\s+(?:особисту\s+|фоп(?:івську)?\s+)?карт(?:ку|ці|ка)\s+(.+)$",
+        text,
         flags=re.IGNORECASE,
     )
     if card_match:
-        owner = normalize_text(card_match.group("owner")).title()
+        owner = normalize_text(card_match.group(1))
         return f"Картка {owner}", "personal_card"
 
     if "фоп" in low and "карт" in low:
@@ -309,10 +236,100 @@ def sum_rows(rows, field="amount") -> Decimal:
     return total
 
 
+# ------------------------ Parser dictionaries ------------------------
+
+DEBT_RETURN_RE = re.compile(
+    r"\b(повернен(?:ня|о)?|повернув|повернула|повернули|"
+    r"віддав|віддала|віддали|погасив|погасила|погасили|"
+    r"закрив|закрила|закрили|приніс|принесла|принесли|"
+    r"оплатив|оплатила|оплатили|заплатив|заплатила|заплатили)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def contains_debt_return_marker(text: str) -> bool:
+    return bool(DEBT_RETURN_RE.search(text))
+
+
+def handle_advance(message, text: str) -> bool:
+    """Запис авансу.
+
+    За замовчуванням "аванс ..." — це отриманий аванс (надходження).
+    Явні слова видачі/сплати або початок "з каси/з картки" — витрата.
+    """
+    low = text.lower()
+    if "аванс" not in low:
+        return False
+
+    incoming_markers = (
+        "отримав", "отримала", "отримали", "прийшов", "прийшла",
+        "надійшов", "надійшла", "надійшло", "зайшов", "зайшло",
+    )
+    outgoing_markers = (
+        "дали аванс", "дав аванс", "дала аванс", "видали аванс",
+        "видав аванс", "видала аванс", "сплатив аванс", "сплатила аванс",
+        "сплатили аванс", "оплатив аванс", "оплатила аванс",
+        "оплатили аванс", "заплатив аванс", "заплатила аванс",
+        "заплатили аванс",
+    )
+
+    is_outgoing = (
+        low.startswith(("з каси", "із каси", "з картки", "із картки", "з фоп", "із фоп"))
+        or any(word in low for word in outgoing_markers)
+    )
+    # Явне отримання має пріоритет над загальним словом "аванс".
+    if any(word in low for word in incoming_markers):
+        is_outgoing = False
+
+    amount, currency, match = extract_amount_currency(text)
+    account_name, _ = default_account_name(text)
+
+    # Залишаємо назву/контрагента як опис, прибравши службове слово "аванс".
+    description = normalize_text(text[match.end():])
+    description = re.sub(r"^[-—:;, ]+", "", description)
+    description = description or "Аванс"
+
+    operation_type = "expense" if is_outgoing else "income"
+    add_cash_operation(
+        message,
+        operation_type,
+        amount,
+        currency,
+        description,
+        account_name=account_name,
+    )
+
+    if is_outgoing:
+        bot.reply_to(
+            message,
+            f"✅ Виданий аванс записано\n\n"
+            f"➖ <b>{money(amount, currency)}</b>\n"
+            f"📍 Рахунок: {account_name}\n"
+            f"📝 {description}",
+        )
+    else:
+        bot.reply_to(
+            message,
+            f"✅ Отриманий аванс записано\n\n"
+            f"➕ <b>{money(amount, currency)}</b>\n"
+            f"📍 Зараховано: {account_name}\n"
+            f"📝 {description}",
+        )
+    return True
+
+
 # ------------------------ Old cash operations ------------------------
 
-def add_cash_operation(message, operation_type: str, amount: Decimal, currency: str, description: str):
-    account_name, _ = default_account_name(description)
+def add_cash_operation(
+    message,
+    operation_type: str,
+    amount: Decimal,
+    currency: str,
+    description: str,
+    account_name: str | None = None,
+):
+    if not account_name:
+        account_name, _ = default_account_name(description)
     sb_insert(
         "cash_operations",
         operation_payload(
@@ -327,63 +344,36 @@ def add_cash_operation(message, operation_type: str, amount: Decimal, currency: 
 
 
 def handle_income_expense(message, text: str) -> bool:
-    low = normalize_text(text).lower()
+    low = text.lower()
 
-    income_words = (
-        "виручка", "дохід", "доход", "прихід", "приход", "надходження",
-        "отримав", "отримали", "надійшло", "зайшло", "оренда", "орендна плата",
-        "склад", "базар", "ринок",
-    )
-    expense_words = (
-        "витрата", "расход", "видаток", "витрати", "оплата", "сплата", "платіж",
-        "оплатив", "оплатили", "сплатив", "сплатили", "заплатив", "заплатили",
-        "купив", "купили", "зарплата",
-    )
+    income_words = ("виручка", "дохід", "доход", "прихід", "приход")
+    expense_words = ("витрата", "расход", "видаток", "витрати")
 
-    operation_type = None
-    source_label = None
     if low.startswith(income_words):
-        operation_type = "income"
-        if low.startswith(("оренда", "орендна плата")):
-            source_label = "Оренда"
-        elif low.startswith("склад"):
-            source_label = "Склад"
-        elif low.startswith(("базар", "ринок")):
-            source_label = "Базар"
-        else:
-            source_label = "Надходження"
-    elif low.startswith(expense_words):
-        operation_type = "expense"
+        amount, currency, match = extract_amount_currency(text)
+        description = normalize_text(text[match.end():]) or "Виручка"
+        add_cash_operation(message, "income", amount, currency, description)
+        bot.reply_to(
+            message,
+            f"✅ Записано виручку: <b>{money(amount, currency)}</b>\n"
+            f"📍 Рахунок: {default_account_name(description)[0]}\n"
+            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
+        )
+        return True
 
-    if not operation_type:
-        return False
+    if low.startswith(expense_words):
+        amount, currency, match = extract_amount_currency(text)
+        description = normalize_text(text[match.end():]) or "Витрата"
+        add_cash_operation(message, "expense", amount, currency, description)
+        bot.reply_to(
+            message,
+            f"✅ Записано витрату: <b>{money(amount, currency)}</b>\n"
+            f"📝 {description}\n"
+            f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
+        )
+        return True
 
-    amounts = extract_all_amounts(text)
-    account_name, _ = default_account_name(text)
-    description = remove_amounts_and_accounts(text)
-
-    # Прибираємо тільки перше службове слово, а решту залишаємо описом.
-    first_word_pattern = income_words if operation_type == "income" else expense_words
-    for word in sorted(first_word_pattern, key=len, reverse=True):
-        if description.lower().startswith(word):
-            description = normalize_text(description[len(word):])
-            break
-    description = description or source_label or ("Витрата" if operation_type == "expense" else "Надходження")
-
-    saved = []
-    for amount, currency, _ in amounts:
-        add_cash_operation(message, operation_type, amount, currency, f"{source_label + ': ' if source_label else ''}{description}")
-        saved.append(money(amount, currency))
-
-    sign_label = "надходження" if operation_type == "income" else "витрату"
-    bot.reply_to(
-        message,
-        f"✅ Записано {sign_label}: <b>{', '.join(saved)}</b>\n"
-        f"📍 Рахунок: {account_name}\n"
-        f"📝 {description}\n"
-        f"👤 Вніс: {user_fields(message)['telegram_full_name']}",
-    )
-    return True
+    return False
 
 
 # ------------------------ Revisions ------------------------
@@ -461,6 +451,11 @@ def create_debt(message, customer_name: str, amount: Decimal, currency: str, des
 def handle_debt_create(message, text: str) -> bool:
     low = text.lower()
     if not low.startswith("борг "):
+        return False
+
+    # "борг Болена 2000 грн в касу повернення" — це погашення,
+    # а не створення нового боргу.
+    if contains_debt_return_marker(text):
         return False
 
     # "борг Bolena 25000 грн полікарбонат"
@@ -541,24 +536,39 @@ def handle_debt_queries(message, text: str) -> bool:
 
 
 def handle_debt_payment(message, text: str) -> bool:
-    payment_word = re.search(
-        r"\b(повернув|повернула|повернули|віддав|віддала|віддали|"
-        r"оплатив|оплатила|оплатили|заплатив|заплатила|погасив|погасила|"
-        r"приніс|принесла|закрив|закрила)\b",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not payment_word:
+    """Часткове або повне повернення боргу.
+
+    Підтримує, зокрема:
+    - Болена повернула 2000 грн в касу
+    - Болена принесла 2000 грн наличкою
+    - борг Болена 2000 грн в касу повернення
+    - Болена погасила борг 2000 грн на картку Миколи
+    """
+    if not contains_debt_return_marker(text):
         return False
 
-    customer = normalize_text(text[:payment_word.start()])
-    if not customer:
-        return False
-
-    tail = text[payment_word.end():]
     try:
-        amount, currency, match = extract_amount_currency(tail)
+        amount, currency, amount_match = extract_amount_currency(text)
     except ValueError:
+        return False
+
+    low = text.lower().strip()
+
+    if low.startswith("борг "):
+        # Ім'я стоїть після слова "борг" і перед сумою.
+        customer_part = text[5:amount_match.start()]
+    else:
+        marker = DEBT_RETURN_RE.search(text)
+        if not marker:
+            return False
+        customer_part = text[:marker.start()]
+
+    # Прибираємо службові слова, якщо користувач написав
+    # "борг Болена повернення 2000 грн".
+    customer = DEBT_RETURN_RE.sub(" ", customer_part)
+    customer = re.sub(r"\b(борг|боргу|повернення)\b", " ", customer, flags=re.IGNORECASE)
+    customer = normalize_text(customer)
+    if not customer:
         return False
 
     debts = find_open_debts(message.chat.id, customer)
@@ -582,102 +592,17 @@ def handle_debt_payment(message, text: str) -> bool:
         )
         return True
 
-    destination_text = normalize_text(tail[match.end():])
-    account_name, account_type = default_account_name(destination_text)
-    account = get_or_create_account(message.chat.id, account_name, currency, account_type)
-
-    remaining_payment = amount
-    affected = []
-
-    for debt in debts:
-        if remaining_payment <= 0:
-            break
-
-        debt_remaining = Decimal(str(debt["outstanding_amount"]))
-        part = min(remaining_payment, debt_remaining)
-        new_paid = Decimal(str(debt["paid_amount"])) + part
-        new_outstanding = debt_remaining - part
-        new_status = "closed" if new_outstanding == 0 else "partially_paid"
-
-        sb_insert(
-            "debt_payments",
-            {
-                "payment_date": today_str(),
-                "telegram_chat_id": message.chat.id,
-                "debt_id": debt["id"],
-                "amount": float(part),
-                "currency": currency,
-                "destination_account_id": account["id"],
-                "destination_account_name": account_name,
-                "description": destination_text or f"Оплата боргу {debt['customer_name']}",
-                "is_cancelled": False,
-                **user_fields(message),
-            },
-        )
-
-        update_payload = {
-            "paid_amount": float(new_paid),
-            "outstanding_amount": float(new_outstanding),
-            "status": new_status,
-            "closed_at": datetime.now(KYIV).isoformat() if new_status == "closed" else None,
-        }
-        sb_update("customer_debts", {"id": f"eq.{debt['id']}"}, update_payload)
-        affected.append((debt["customer_name"], part))
-        remaining_payment -= part
-
-    left = outstanding_total - amount
-    bot.reply_to(
-        message,
-        f"✅ Оплату боргу записано\n\n"
-        f"👤 {customer}\n"
-        f"💰 Отримано: <b>{money(amount, currency)}</b>\n"
-        f"📍 Зараховано: {account_name}\n"
-        f"📒 Залишок боргу: {money(left, currency)}\n"
-        "ℹ️ У виручку повторно не додано.",
-    )
-    return True
-
-
-def handle_context_debt_payment(message, text: str) -> bool:
-    """Коротка фраза: 'Болена на карту Миколи 2000 грн'.
-
-    Автопогашення виконується лише тоді, коли знайдено відкритий борг цього
-    контрагента в тій самій валюті. Інакше обробник нічого не записує.
-    """
-    customer = find_customer_from_transfer_text(text)
-    if not customer:
-        return False
-
-    try:
-        amount, currency, match = extract_amount_currency(text)
-    except ValueError:
-        return False
-
-    debts = [d for d in find_open_debts(message.chat.id, customer) if d["currency"] == currency]
-    if not debts:
-        return False
-
-    # Захист від випадкового списання: ім'я має збігатися повністю хоча б з одним боргом.
-    exact = [d for d in debts if d["customer_name"].casefold() == customer.casefold()]
-    if exact:
-        debts = exact
-
-    outstanding_total = sum_rows(debts, "outstanding_amount")
-    if amount > outstanding_total:
-        bot.reply_to(
-            message,
-            f"⚠️ У <b>{customer}</b> борг {money(outstanding_total, currency)}, "
-            f"а вказано {money(amount, currency)}. Нічого не записав.",
-        )
-        return True
-
+    # Шукаємо рахунок у всій фразі: "в касу", "наличкою",
+    # "на картку Миколи" тощо. За замовчуванням — готівка/Сейф.
     account_name, account_type = default_account_name(text)
     account = get_or_create_account(message.chat.id, account_name, currency, account_type)
+    destination_text = normalize_text(text[amount_match.end():])
 
     remaining_payment = amount
     for debt in debts:
         if remaining_payment <= 0:
             break
+
         debt_remaining = Decimal(str(debt["outstanding_amount"]))
         part = min(remaining_payment, debt_remaining)
         new_paid = Decimal(str(debt["paid_amount"])) + part
@@ -694,11 +619,12 @@ def handle_context_debt_payment(message, text: str) -> bool:
                 "currency": currency,
                 "destination_account_id": account["id"],
                 "destination_account_name": account_name,
-                "description": f"Повернення боргу {debt['customer_name']}",
+                "description": destination_text or f"Повернення боргу {debt['customer_name']}",
                 "is_cancelled": False,
                 **user_fields(message),
             },
         )
+
         sb_update(
             "customer_debts",
             {"id": f"eq.{debt['id']}"},
@@ -712,13 +638,15 @@ def handle_context_debt_payment(message, text: str) -> bool:
         remaining_payment -= part
 
     left = outstanding_total - amount
+    display_account = "Каса" if account_name == "Сейф" else account_name
     bot.reply_to(
         message,
         f"✅ Повернення боргу записано\n\n"
-        f"👤 <b>{customer}</b>\n"
+        f"👤 {customer}\n"
         f"💰 Отримано: <b>{money(amount, currency)}</b>\n"
-        f"📍 Зараховано: {account_name}\n"
-        f"📒 Залишок боргу: <b>{money(left, currency)}</b>",
+        f"📍 Зараховано: {display_account}\n"
+        f"📒 Залишок боргу: {money(left, currency)}\n"
+        "ℹ️ У виручку повторно не додано.",
     )
     return True
 
@@ -1064,7 +992,7 @@ def history_text(chat_id: int):
 # ------------------------ Commands ------------------------
 
 HELP_TEXT = """
-<b>Dvir Finance v2.1 Parser</b>
+<b>Dvir Finance v2.0</b>
 
 Основні команди:
 
@@ -1075,6 +1003,12 @@ HELP_TEXT = """
 
 <code>борг Bolena 5000 грн полікарбонат</code>
 <code>Bolena оплатила 3000 грн у сейф</code>
+<code>борг Bolena 2000 грн в касу повернення</code>
+<code>Bolena повернула 2000 грн наличкою</code>
+
+Аванс:
+<code>аванс 1000$ натяжні потолки</code>
+<code>з каси дали аванс 5000 грн постачальнику</code>
 <code>борги</code>
 <code>борг Bolena</code>
 
@@ -1088,7 +1022,6 @@ HELP_TEXT = """
 <code>звіт</code>
 <code>історія</code>
 <code>видалити останню</code>
-<code>версія</code>
 <code>/id</code>
 """.strip()
 
@@ -1117,7 +1050,7 @@ def text_handler(message):
             bot.reply_to(
                 message,
                 f"✅ <b>{VERSION}</b>\n"
-                "Режим: центральний локальний парсер\n"
+                "Режим: локальні перевірені правила\n"
                 "ШІ для запису: вимкнено",
             )
             return
@@ -1171,11 +1104,13 @@ def text_handler(message):
             return
         if handle_debt_queries(message, text):
             return
-        if handle_debt_create(message, text):
-            return
+        # Погашення перевіряємо раніше за створення боргу,
+        # щоб слово "борг" у фразі повернення не створило новий запис.
         if handle_debt_payment(message, text):
             return
-        if handle_context_debt_payment(message, text):
+        if handle_debt_create(message, text):
+            return
+        if handle_advance(message, text):
             return
         if handle_income_expense(message, text):
             return
