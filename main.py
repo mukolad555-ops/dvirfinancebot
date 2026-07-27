@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 5.5-20000-TESTS-FINAL-20260724"
+VERSION = "DvirFinance 6.0-CONTRAGENTS-FIX-20260727"
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
@@ -369,7 +369,7 @@ def default_account_name(text: str) -> tuple[str, str]:
         (r"(?:південн(?:ий|ого|ому)|южн(?:ий|ого|ому)|южный)", "bank"),
         (r"приват(?:банк)?", "bank"),
         (r"\bфоп\b", "fop_account"),
-        (r"карт(?:ка|ки|ку|ці|кою|у)|карточ(?:ка|ки|ку|ке|кой)|\bкарта\b", "personal_card"),
+        (r"карт(?:а|и|ка|ки|ку|ці|кою|у)|карточ(?:ка|ки|ку|ке|кой)|\bкарта\b", "personal_card"),
     ]
     for pattern, account_type in bank_patterns:
         if re.search(pattern, low, flags=re.IGNORECASE):
@@ -898,6 +898,66 @@ def handle_debt_create(message, text: str) -> bool:
     return True
 
 
+def _person_name_key(value: str) -> str:
+    """Stable comparison key for debtor names without changing stored display text.
+
+    Handles capitalization and common Ukrainian/Russian case endings:
+    Наталя/Наталі/Наталю, Болена/Болени/Болену, Боря/борі/борю.
+    This is deliberately conservative: it never auto-merges different multi-word names.
+    """
+    value = normalize_text(value).casefold().replace("ё", "е")
+    value = re.sub(r"[^0-9a-zа-яіїєґ' -]+", "", value)
+    parts = [p for p in value.split() if p]
+    result = []
+    for part in parts:
+        token = part.strip("'-")
+        if len(token) >= 5:
+            # Longer endings first. Keep at least four letters to avoid overmatching.
+            for ending in (
+                "ями", "ами", "ові", "еві", "єві", "ого", "ому", "ему",
+                "ою", "ею", "єю", "ові", "еві", "ів", "їв",
+                "а", "я", "і", "ї", "и", "у", "ю", "е", "є", "о",
+            ):
+                if token.endswith(ending) and len(token) - len(ending) >= 4:
+                    token = token[:-len(ending)]
+                    break
+        result.append(token)
+    return " ".join(result)
+
+
+def _matched_debt_names(rows, customer_query: str):
+    query_text = normalize_text(customer_query)
+    query_fold = query_text.casefold()
+    query_key = _person_name_key(query_text)
+
+    # 1. Exact text, ignoring case and spaces.
+    exact_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if normalize_text(r["customer_name"]).casefold() == query_fold
+    }
+    if exact_names:
+        return exact_names
+
+    # 2. Same conservative grammatical key. This merges case forms, not arbitrary people.
+    keyed_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if _person_name_key(r["customer_name"]) == query_key and query_key
+    }
+    if keyed_names:
+        return keyed_names
+
+    # 3. Unique partial textual match only.
+    partial_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if query_fold in normalize_text(r["customer_name"]).casefold()
+        or normalize_text(r["customer_name"]).casefold() in query_fold
+    }
+    return partial_names if len(partial_names) == 1 else set()
+
+
 def find_open_debts(chat_id: int, customer_query: str | None = None):
     params = {
         "select": "*",
@@ -908,14 +968,11 @@ def find_open_debts(chat_id: int, customer_query: str | None = None):
     }
     rows = sb_select("customer_debts", params)
     if customer_query:
-        query = normalize_text(customer_query).casefold()
-        exact = [r for r in rows if normalize_text(r["customer_name"]).casefold() == query]
-        if exact:
-            return exact
-        # Частковий пошук дозволяємо лише коли він веде до одного унікального імені.
-        partial = [r for r in rows if query in normalize_text(r["customer_name"]).casefold()]
-        names = {normalize_text(r["customer_name"]).casefold() for r in partial}
-        return partial if len(names) == 1 else []
+        matched_names = _matched_debt_names(rows, customer_query)
+        return [
+            r for r in rows
+            if normalize_text(r["customer_name"]).casefold() in matched_names
+        ]
     return rows
 
 
@@ -996,6 +1053,7 @@ def handle_debt_payment(message, text: str) -> bool:
         return True
 
     outstanding_total = sum_rows(debts, "outstanding_amount")
+    canonical_customer = normalize_text(debts[0]["customer_name"])
     if amount > outstanding_total:
         bot.reply_to(
             message,
@@ -1050,7 +1108,7 @@ def handle_debt_payment(message, text: str) -> bool:
     bot.reply_to(
         message,
         f"✅ Повернення боргу записано\n\n"
-        f"👤 {customer}\n"
+        f"👤 {canonical_customer}\n"
         f"➖ Борг зменшено на: <b>{money(amount, currency)}</b>\n"
         f"📍 Гроші зараховано: {display_account}\n"
         f"📒 Залишок боргу: {money(left, currency)}",
@@ -1240,7 +1298,67 @@ def extract_openai_text(data: dict) -> str:
                 parts.append(content["text"])
     return "\n".join(parts).strip()
 
+def infer_free_text_transfer(text: str) -> str | None:
+    """Deterministically recognize movement between two own accounts.
+
+    Examples: «з картки Миколи 5000 грн в касу»,
+    «зняли 5000 з Південного Андрія і поклали в касу».
+    Such phrases are transfers, never revenue.
+    """
+    normalized = normalize_text(text)
+    low = normalized.casefold()
+    try:
+        amount, currency, amount_match = extract_amount_currency(normalized)
+    except Exception:
+        return None
+
+    account_word = r"(?:кас\w*|сейф\w*|готів\w*|налич\w*|карт\w*|карточ\w*|півден\w*|южн\w*|приват\w*|фоп\w*)"
+    # A transfer must explicitly describe both a source and a destination.
+    if not re.search(r"\b(?:з|із|зі)\b", low) or not re.search(r"\b(?:в|у|на|до)\b", low):
+        return None
+
+    before = normalized[:amount_match.start()]
+    after = normalized[amount_match.end():]
+    source_fragment = ""
+    destination_fragment = ""
+
+    # Common form: «з картки Миколи 5000 грн в касу».
+    m_before = re.search(r"\b(?:з|із|зі)\s+(.+)$", before, flags=re.IGNORECASE)
+    m_after = re.search(r"\b(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
+    if m_before and m_after:
+        source_fragment = m_before.group(1)
+        destination_fragment = m_after.group(1)
+    else:
+        # Form: «5000 грн з картки Миколи в касу».
+        m = re.search(r"\b(?:з|із|зі)\s+(.+?)\s+(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
+        if m:
+            source_fragment, destination_fragment = m.group(1), m.group(2)
+        else:
+            # Form: «зняли 5000 з картки Миколи і поклали в касу».
+            m = re.search(r"\b(?:з|із|зі)\s+(.+?)(?:\s+і\s+|\s+та\s+|,\s*)(?:поклал\w*\s+)?(?:в|у|на|до)\s+(.+)$", after, flags=re.IGNORECASE)
+            if m:
+                source_fragment, destination_fragment = m.group(1), m.group(2)
+
+    if not source_fragment or not destination_fragment:
+        return None
+    if not re.search(account_word, source_fragment, flags=re.IGNORECASE):
+        return None
+    if not re.search(account_word, destination_fragment, flags=re.IGNORECASE):
+        return None
+
+    source, _ = default_account_name(source_fragment)
+    destination, _ = default_account_name(destination_fragment)
+    if source == destination:
+        return None
+    source_display = "Каса" if source == "Сейф" else source
+    destination_display = "Каса" if destination == "Сейф" else destination
+    return f"переказ {money(amount, currency)} з {source_display} на {destination_display}"
+
+
 def ai_suggest_canonical(text: str) -> str | None:
+    transfer = infer_free_text_transfer(text)
+    if transfer:
+        return transfer
     if not AI_HELP_ENABLED or not OPENAI_API_KEY:
         return None
     prompt = f"""Перетвори повідомлення користувача на ОДНУ канонічну команду DvirFinance.
@@ -1252,6 +1370,7 @@ def ai_suggest_canonical(text: str) -> str | None:
 - аванс: отриманий аванс, плюс у касу/на рахунок
 - ревізія: фактичний залишок
 - обмін: обмін однієї валюти на іншу з указаним курсом або двома сумами
+- переказ: переміщення між двома власними рахунками. Фрази «з картки ... в касу», «зняли з картки та поклали в касу» ЗАВЖДИ є переказом, а не виручкою.
 
 Для витрати збережи в команді всі слова про призначення. Виправляй очевидні помилки: грн/гр, карточка/картка, Південний, ФОП.
 Розпізнавай категорії: товар, пальне/бензин, зарплата, доставка, хімія, оренда, податки, комунальні, ремонт, реклама.
