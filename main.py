@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 5.3-AI-CONNECTION-FIX-20260724"
+VERSION = "DvirFinance 5.5-20000-TESTS-FINAL-20260724"
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
@@ -92,8 +92,9 @@ CURRENCY_SYMBOLS = {"UAH": "грн", "USD": "$", "EUR": "€"}
 
 
 EXPENSE_CATEGORY_RULES = {
+    # Specific purpose wins over a document word. Example: "бензин, накладна 428"
+    # is Пальне, not Товар. "Накладна 428" alone still falls back to Товар.
     "Зарплата": ("зарплат", "зп", "аванс праців", "оплата праці", "розрахунок праців"),
-    "Товар": ("за товар", "товар", "закуп", "постачаль", "накладн", "прихідн", "приф"),
     "Пальне": ("бензин", "дизел", "соляр", "пальне", "паливо", "заправ"),
     "Доставка": ("достав", "перевез", "нова пошта", "логіст", "транспорт"),
     "Хімія": ("хімія", "химия", "хімікат", "реагент"),
@@ -102,6 +103,7 @@ EXPENSE_CATEGORY_RULES = {
     "Комунальні": ("комунал", "електро", "світло", "вода", "газ"),
     "Ремонт": ("ремонт", "запчаст", "сервіс"),
     "Реклама": ("реклам", "маркетинг", "таргет"),
+    "Товар": ("за товар", "товар", "закуп", "постачаль", "накладн", "прихідн", "приф"),
 }
 
 def expense_details(text: str) -> dict:
@@ -284,7 +286,7 @@ def money(value, currency: str) -> str:
 def extract_amount_currency(text: str):
     pattern = (
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>гривень|гривні|гривня|грн|гр|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)?"
     )
     match = re.search(pattern, text, flags=re.IGNORECASE)
@@ -512,7 +514,7 @@ def extract_all_amounts_currency(text: str):
     """Read every explicit amount+currency pair, including compact input: 300$,250€."""
     pattern = re.compile(
         r"(?P<amount>\d[\d\s]*(?:[.,]\d{1,2})?)\s*"
-        r"(?P<currency>грн|гр|гривень|гривні|гривня|uah|₴|"
+        r"(?P<currency>гривень|гривні|гривня|грн|гр|uah|₴|"
         r"доларів|долари|долар|дол|usd|\$|євро|евро|eur|€)",
         flags=re.IGNORECASE,
     )
@@ -640,7 +642,18 @@ def handle_transfer(message, text: str) -> bool:
 # ------------------------ Currency exchange ------------------------
 
 def _currency_word_pattern() -> str:
-    return r"грн|гр|гривень|гривні|гривня|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€"
+    return r"гривень|гривні|гривня|грн|гр|uah|₴|доларів|долари|долар|дол|usd|\$|євро|евро|eur|€"
+
+
+def calculate_exchange_amount(from_amount: Decimal, from_currency: str, to_currency: str, rate: Decimal) -> Decimal:
+    """Calculate target amount using the bot's documented rate convention."""
+    if rate <= 0:
+        raise ValueError("Курс має бути більшим за нуль")
+    if from_currency == to_currency:
+        raise ValueError("Вихідна й отримана валюти мають бути різними")
+    if from_currency == "UAH" and to_currency != "UAH":
+        return (from_amount / rate).quantize(Decimal("0.01"))
+    return (from_amount * rate).quantize(Decimal("0.01"))
 
 
 def handle_exchange(message, text: str) -> bool:
@@ -687,10 +700,7 @@ def handle_exchange(message, text: str) -> bool:
         # іноземна валюта → гривні: множимо на курс;
         # іноземна → іноземна: курс означає кількість цільової валюти
         # за 1 одиницю вихідної, тому множимо.
-        if from_currency == "UAH" and to_currency != "UAH":
-            to_amount = (from_amount / rate).quantize(Decimal("0.01"))
-        else:
-            to_amount = (from_amount * rate).quantize(Decimal("0.01"))
+        to_amount = calculate_exchange_amount(from_amount, from_currency, to_currency, rate)
 
     if from_currency == to_currency:
         raise ValueError("Вихідна й отримана валюти мають бути різними")
@@ -816,18 +826,64 @@ def create_debt(message, customer_name: str, amount: Decimal, currency: str, des
     return sb_insert("customer_debts", payload)[0]
 
 
+def parse_debt_command(text: str):
+    """Parse both natural debt orders:
+    - борг Болена 5000 грн товар
+    - борг 5000 грн Болена товар
+
+    Bank/card words are never required for creating a debt.
+    """
+    if first_keyword(text) != "борг":
+        raise ValueError("Команда має починатися словом борг")
+    rest = keyword_tail(text, "борг")
+    amount, currency, match = extract_amount_currency(rest)
+    before = normalize_text(rest[:match.start()])
+    after = normalize_text(rest[match.end():])
+
+    if before:
+        customer = before
+        description = after
+    else:
+        # Amount-first form. First token/group after the amount is the customer.
+        # Optional description follows it. Names may contain two words, but common
+        # expense/account words mark the start of the description.
+        tokens = after.split()
+        if not tokens:
+            customer, description = "", ""
+        else:
+            description_markers = {
+                "товар", "полікарбонат", "підвіконня", "накладна", "згідно",
+                "за", "боргом", "рахунок", "замовлення", "доставка"
+            }
+            split_at = len(tokens)
+            for i, token in enumerate(tokens[1:], 1):
+                if token.casefold() in description_markers:
+                    split_at = i
+                    break
+            # Default to one-word customer in amount-first shorthand; preserve
+            # two-word names when the second word looks like a patronymic/surname.
+            if split_at == len(tokens) and len(tokens) > 1:
+                second = tokens[1].casefold()
+                patronymic_suffixes = ("ович", "евич", "йович", "івна", "ївна", "овна", "енко", "чук", "юк", "ук")
+                split_at = 2 if second.endswith(patronymic_suffixes) else 1
+            customer = normalize_text(" ".join(tokens[:split_at]))
+            description = normalize_text(" ".join(tokens[split_at:]))
+
+    # A debt is a receivable record, not a cash-account operation. Strip accidental
+    # account-only tails from the customer only when no real name remains.
+    if customer.casefold() in {"каса", "картка", "карта", "південний", "приват", "фоп", "банк"}:
+        customer = ""
+    return customer, amount, currency, description
+
+
 def handle_debt_create(message, text: str) -> bool:
     if first_keyword(text) != "борг":
         return False
 
-    # "борг Bolena 25000 грн полікарбонат"
-    rest = text[5:].strip()
-    amount, currency, match = extract_amount_currency(rest)
-    customer = normalize_text(rest[:match.start()])
-    description = normalize_text(rest[match.end():])
+    customer, amount, currency, description = parse_debt_command(text)
 
     if not customer:
-        bot.reply_to(message, "Напиши ім’я покупця: <code>борг Bolena 25000 грн</code>")
+        bot.reply_to(message, "Напиши ім’я боржника: <code>борг Болена 25000 грн</code>")
         return True
 
     debt = create_debt(message, customer, amount, currency, description)
@@ -1100,8 +1156,15 @@ def ai_suggest_options(text: str) -> list[str]:
 Ключові слова: виручка, витрата, борг, повернення, аванс, ревізія, залишок, обмін, переказ.
 Рахунки: Каса, Картка Миколи, Картка Андрія, Приват Миколи, Приват Андрія, ФОП Миколи, ФОП Андрія, Південний Миколи, Південний Андрія.
 «Південний», «Південний банк», «банк Південний» означають один банк. «з карти/картки» означає рахунок списання; «на карту/картку» — рахунок зарахування.
-Не вигадуй суму, валюту, власника чи призначення. Якщо власник/рахунок неоднозначний, дай кілька варіантів. Якщо валюта відсутня — грн.
-Для переказу форма: переказ 5000 грн з Картки Андрія на Касу.
+Не вигадуй суму, валюту, власника, боржника чи призначення. Якщо власник/рахунок неоднозначний, дай кілька варіантів. Якщо валюта відсутня — грн.
+
+ЖОРСТКІ ПРАВИЛА ЗА КОМАНДАМИ:
+- борг: це запис «нам винні». Потрібні тільки ім'я боржника, сума, валюта й необов'язковий опис. НІКОЛИ не додавай Касу, картку, Південний, Приват або ФОП і не роби варіанти за рахунками. Канонічно: борг Болена 5000 грн товар.
+- повернення: ім'я боржника + сума; рахунок потрібен лише як місце фактичного надходження. Без рахунку — в Касу.
+- витрата: сума списується з указаного рахунку; без рахунку — Каса.
+- виручка/аванс: сума додається на вказаний рахунок; без рахунку — Каса.
+- переказ: обов'язково два різні власні рахунки. Форма: переказ 5000 грн з Картки Андрія на Касу.
+- обмін: один рахунок, вихідна валюта, цільова валюта, курс або дві суми.
 Для витрати форма: витрата 5000 грн Південний Андрія призначення.
 Повідомлення: {base}"""
     try:
@@ -1123,6 +1186,18 @@ def ai_suggest_options(text: str) -> list[str]:
             cmd=local_normalize_command(item)
             if expected == "витрата" and first_keyword(cmd) != "витрата":
                 continue
+            if first_keyword(cmd) != expected:
+                continue
+            if expected == "борг":
+                # Debt creation must never branch by cash/bank account.
+                if any(word in cmd.casefold() for word in ("південний", "картка", "карта", "приват", "фоп", "каса", "банк")):
+                    continue
+                try:
+                    customer, _, _, _ = parse_debt_command(cmd)
+                    if not customer:
+                        continue
+                except Exception:
+                    continue
             if canonical_command_is_safe(cmd) and cmd not in out:
                 out.append(cmd)
         return out or ([base] if canonical_command_is_safe(base) else [])
@@ -1132,12 +1207,25 @@ def ai_suggest_options(text: str) -> list[str]:
 
 def canonical_command_is_safe(command: str) -> bool:
     command = normalize_text(command)
-    if not command or first_keyword(command) not in CANONICAL_KEYWORDS:
+    keyword = first_keyword(command)
+    if not command or keyword not in CANONICAL_KEYWORDS:
         return False
     if not re.search(r"\d", command):
         return False
     try:
         extract_amount_currency(command)
+        if keyword == "борг":
+            customer, _, _, _ = parse_debt_command(command)
+            if not customer:
+                return False
+        elif keyword == "переказ":
+            low = command.casefold()
+            if " з " not in f" {low} " or " на " not in f" {low} ":
+                return False
+        elif keyword == "обмін":
+            low = command.casefold()
+            if " на " not in f" {low} ":
+                return False
     except Exception:
         return False
     return len(command) <= 240
@@ -1631,7 +1719,7 @@ def source_month_summary(chat_id: int, source: str) -> str:
         "limit": "1000",
     })
     needle = source.lower()
-    matched = [r for r in rows if needle in (r.get("description") or "").lower()]
+    matched = [r for r in rows if re.search(rf"(?<![\wа-яіїєґ]){re.escape(needle)}(?![\wа-яіїєґ])", (r.get("description") or "").lower(), flags=re.IGNORECASE)]
     totals = {}
     accounts = {}
     for row in matched:
