@@ -809,11 +809,68 @@ def handle_revision(message, text: str) -> bool:
 
 # ------------------------ Debts ------------------------
 
+PERSON_ENDINGS = (
+    "ові", "еві", "єві", "ому", "ему",
+    "ами", "ями", "ах", "ях",
+    "ою", "ею", "єю",
+    "ові", "еві",
+    "ий", "ій", "ої", "ій",
+    "а", "я", "у", "ю", "і", "и", "е", "о",
+)
+
+def person_lookup_key(raw_name: str) -> str:
+    """Conservative lookup key for Ukrainian/Russian name inflections.
+
+    Examples: Наталя/Наталі/Наталю -> натал; Болена/Болени/Болену -> болен;
+    Боря/боря/Борю -> бор. Exact text is still preferred before this key.
+    """
+    text = normalize_text(raw_name).casefold().replace("ё", "е")
+    text = re.sub(r"[^0-9a-zа-яіїєґ' -]+", " ", text, flags=re.IGNORECASE)
+    words = [w.strip("'-") for w in text.split() if w.strip("'-")]
+    stems = []
+    for word in words:
+        stem = word
+        if len(stem) >= 3:
+            for ending in PERSON_ENDINGS:
+                if stem.endswith(ending) and len(stem) - len(ending) >= 2:
+                    stem = stem[:-len(ending)]
+                    break
+        stems.append(stem)
+    return " ".join(stems)
+
+def resolve_customer_rows(rows, customer_query: str):
+    """Return matching rows only when the person can be resolved unambiguously."""
+    query_text = normalize_text(customer_query).casefold()
+    exact = [r for r in rows if normalize_text(r.get("customer_name", "")).casefold() == query_text]
+    if exact:
+        return exact
+
+    query_key = person_lookup_key(customer_query)
+    keyed = [r for r in rows if query_key and person_lookup_key(r.get("customer_name", "")) == query_key]
+    if keyed:
+        unique_names = {normalize_text(r.get("customer_name", "")).casefold() for r in keyed}
+        # Different case/inflection spellings of the same key are one counterparty.
+        return keyed if len({person_lookup_key(n) for n in unique_names}) == 1 else []
+
+    partial = [r for r in rows if query_text and query_text in normalize_text(r.get("customer_name", "")).casefold()]
+    names = {normalize_text(r.get("customer_name", "")).casefold() for r in partial}
+    return partial if len(names) == 1 else []
+
+def existing_customer_display_name(chat_id: int, proposed_name: str) -> str:
+    """Reuse the spelling already present in history to avoid Боря/боря duplicates."""
+    rows = sb_select("customer_debts", {
+        "select": "customer_name",
+        "telegram_chat_id": f"eq.{chat_id}",
+        "order": "created_at.asc",
+    })
+    matches = resolve_customer_rows(rows, proposed_name)
+    return normalize_text(matches[0]["customer_name"]) if matches else normalize_text(proposed_name)
+
 def create_debt(message, customer_name: str, amount: Decimal, currency: str, description: str):
     payload = {
         "debt_date": today_str(),
         "telegram_chat_id": message.chat.id,
-        "customer_name": normalize_text(customer_name),
+        "customer_name": existing_customer_display_name(message.chat.id, customer_name),
         "description": description or None,
         "currency": currency,
         "original_amount": float(amount),
@@ -898,66 +955,6 @@ def handle_debt_create(message, text: str) -> bool:
     return True
 
 
-def _person_name_key(value: str) -> str:
-    """Stable comparison key for debtor names without changing stored display text.
-
-    Handles capitalization and common Ukrainian/Russian case endings:
-    Наталя/Наталі/Наталю, Болена/Болени/Болену, Боря/борі/борю.
-    This is deliberately conservative: it never auto-merges different multi-word names.
-    """
-    value = normalize_text(value).casefold().replace("ё", "е")
-    value = re.sub(r"[^0-9a-zа-яіїєґ' -]+", "", value)
-    parts = [p for p in value.split() if p]
-    result = []
-    for part in parts:
-        token = part.strip("'-")
-        if len(token) >= 5:
-            # Longer endings first. Keep at least four letters to avoid overmatching.
-            for ending in (
-                "ями", "ами", "ові", "еві", "єві", "ого", "ому", "ему",
-                "ою", "ею", "єю", "ові", "еві", "ів", "їв",
-                "а", "я", "і", "ї", "и", "у", "ю", "е", "є", "о",
-            ):
-                if token.endswith(ending) and len(token) - len(ending) >= 4:
-                    token = token[:-len(ending)]
-                    break
-        result.append(token)
-    return " ".join(result)
-
-
-def _matched_debt_names(rows, customer_query: str):
-    query_text = normalize_text(customer_query)
-    query_fold = query_text.casefold()
-    query_key = _person_name_key(query_text)
-
-    # 1. Exact text, ignoring case and spaces.
-    exact_names = {
-        normalize_text(r["customer_name"]).casefold()
-        for r in rows
-        if normalize_text(r["customer_name"]).casefold() == query_fold
-    }
-    if exact_names:
-        return exact_names
-
-    # 2. Same conservative grammatical key. This merges case forms, not arbitrary people.
-    keyed_names = {
-        normalize_text(r["customer_name"]).casefold()
-        for r in rows
-        if _person_name_key(r["customer_name"]) == query_key and query_key
-    }
-    if keyed_names:
-        return keyed_names
-
-    # 3. Unique partial textual match only.
-    partial_names = {
-        normalize_text(r["customer_name"]).casefold()
-        for r in rows
-        if query_fold in normalize_text(r["customer_name"]).casefold()
-        or normalize_text(r["customer_name"]).casefold() in query_fold
-    }
-    return partial_names if len(partial_names) == 1 else set()
-
-
 def find_open_debts(chat_id: int, customer_query: str | None = None):
     params = {
         "select": "*",
@@ -968,11 +965,7 @@ def find_open_debts(chat_id: int, customer_query: str | None = None):
     }
     rows = sb_select("customer_debts", params)
     if customer_query:
-        matched_names = _matched_debt_names(rows, customer_query)
-        return [
-            r for r in rows
-            if normalize_text(r["customer_name"]).casefold() in matched_names
-        ]
+        return resolve_customer_rows(rows, customer_query)
     return rows
 
 
@@ -1053,7 +1046,6 @@ def handle_debt_payment(message, text: str) -> bool:
         return True
 
     outstanding_total = sum_rows(debts, "outstanding_amount")
-    canonical_customer = normalize_text(debts[0]["customer_name"])
     if amount > outstanding_total:
         bot.reply_to(
             message,
@@ -1105,10 +1097,11 @@ def handle_debt_payment(message, text: str) -> bool:
 
     left = outstanding_total - amount
     display_account = "Каса" if account_name == "Сейф" else account_name
+    display_customer = normalize_text(debts[0]["customer_name"])
     bot.reply_to(
         message,
         f"✅ Повернення боргу записано\n\n"
-        f"👤 {canonical_customer}\n"
+        f"👤 {display_customer}\n"
         f"➖ Борг зменшено на: <b>{money(amount, currency)}</b>\n"
         f"📍 Гроші зараховано: {display_account}\n"
         f"📒 Залишок боргу: {money(left, currency)}",
