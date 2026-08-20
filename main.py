@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 6.1-PERIODS-COMMENTS-20260820"
+VERSION = "DvirFinance 6.2-FINAL-20260820"
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
@@ -156,6 +156,28 @@ def structured_expense_description(raw_description: str) -> tuple[str, dict]:
         parts.append(f"Накладна: {details['invoice']}")
     parts.append(f"Коментар: {comment}")
     return " | ".join(parts), details
+
+def income_preview_text(command: str) -> str:
+    """Preview every currency in one revenue message before anything is saved."""
+    try:
+        tail = keyword_tail(command, "виручка")
+        amounts = extract_all_amounts_currency(tail)
+        account_name, _ = default_account_name(command)
+        description = tail
+        for _, _, match in reversed(amounts):
+            description = description[:match.start()] + " " + description[match.end():]
+        description = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", description))
+        display_account = "Каса" if account_name == "Сейф" else account_name
+        lines = ["🧾 <b>Перевір виручку</b>", ""]
+        lines += [f"➕ <b>{money(a, c)}</b>" for a, c, _ in amounts]
+        lines.append(f"📍 Зарахувати: <b>{display_account}</b>")
+        if description and description.casefold() != "виручка":
+            lines.append(f"📝 Джерело/коментар: {description}")
+        lines.append("\nНічого ще не записано.")
+        return "\n".join(lines)
+    except Exception:
+        return "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{command}</code>" + "\n\nНічого ще не записано."
+
 
 def expense_preview_text(command: str) -> str:
     try:
@@ -1233,9 +1255,19 @@ def ai_live_status() -> tuple[bool, str]:
     return False, error or "немає коректної відповіді"
 
 
+def explicit_amount_signature(text: str) -> list[tuple[str, str]]:
+    """Stable comparison key so AI cannot silently drop a currency from income/expense."""
+    try:
+        pairs = extract_all_amounts_currency(text)
+        return sorted((format(a.normalize(), "f"), c) for a, c, _ in pairs)
+    except Exception:
+        return []
+
+
 def ai_suggest_options(text: str) -> list[str]:
     """Return 1-3 safe canonical interpretations. AI never writes; user chooses one."""
     base = local_normalize_command(text)
+    expected_amounts = explicit_amount_signature(base) if first_keyword(base) in ("виручка", "витрата") else []
     if not AI_HELP_ENABLED or not OPENAI_API_KEY:
         return [base] if canonical_command_is_safe(base) else []
     prompt = f"""Ти розбираєш бухгалтерське повідомлення DvirFinance. Перше слово задає дію і його не можна змінювати, крім форми «витрати» -> «витрата».
@@ -1249,7 +1281,7 @@ def ai_suggest_options(text: str) -> list[str]:
 - борг: це запис «нам винні». Потрібні тільки ім'я боржника, сума, валюта й необов'язковий опис. НІКОЛИ не додавай Касу, картку, Південний, Приват або ФОП і не роби варіанти за рахунками. Канонічно: борг Болена 5000 грн товар.
 - повернення: ім'я боржника + сума; рахунок потрібен лише як місце фактичного надходження. Без рахунку — в Касу.
 - витрата: сума списується з указаного рахунку; без рахунку — Каса.
-- виручка/аванс: сума додається на вказаний рахунок; без рахунку — Каса.
+- виручка/аванс: сума додається на вказаний рахунок; без рахунку — Каса. Якщо у виручці є кілька сум у різних валютах (наприклад 10000 грн 500$ 200€), ОБОВ'ЯЗКОВО збережи ВСІ суми та валюти в одній команді без втрат.
 - переказ: обов'язково два різні власні рахунки. Форма: переказ 5000 грн з Картки Андрія на Касу.
 - обмін: один рахунок, вихідна валюта, цільова валюта, курс або дві суми.
 Для витрати форма: витрата 5000 грн Південний Андрія призначення.
@@ -1275,6 +1307,9 @@ def ai_suggest_options(text: str) -> list[str]:
                 continue
             if first_keyword(cmd) != expected:
                 continue
+            if expected in ("виручка", "витрата") and expected_amounts:
+                if explicit_amount_signature(cmd) != expected_amounts:
+                    continue
             if expected == "борг":
                 # Debt creation must never branch by cash/bank account.
                 if any(word in cmd.casefold() for word in ("південний", "картка", "карта", "приват", "фоп", "каса", "банк")):
@@ -1454,9 +1489,12 @@ def offer_direct_confirmation(message, original_text: str) -> bool:
             telebot.types.InlineKeyboardButton("❌ Скасувати", callback_data=f"direct_no:{token}"),
         )
         suggestion=options[0]
-        preview = expense_preview_text(suggestion) if first_keyword(suggestion) == "витрата" else (
-            "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{suggestion}</code>" + "\n\nНічого ще не записано."
-        )
+        if first_keyword(suggestion) == "витрата":
+            preview = expense_preview_text(suggestion)
+        elif first_keyword(suggestion) == "виручка":
+            preview = income_preview_text(suggestion)
+        else:
+            preview = "🧾 <b>Перевір операцію</b>\n\n" + f"<code>{suggestion}</code>" + "\n\nНічого ще не записано."
         bot.reply_to(message, preview + "\n\nПідтвердити цю операцію?", reply_markup=markup)
     else:
         lines=["🤖 <b>Я бачу кілька можливих варіантів</b>", "", "Нічого ще не записано."]
@@ -2010,6 +2048,37 @@ def report_period_text(chat_id: int, period_raw: str = "") -> str:
     return "\n".join(lines).strip()
 
 
+def revenue_period_daily_text(chat_id: int, period_raw: str = "тиждень") -> str:
+    """Revenue only, grouped by calendar day and currency; includes zero-revenue days."""
+    start, end, label = parse_period_spec(period_raw or "тиждень")
+    rows = _income_rows_for_period(chat_id, start, end)
+    days: dict[str, dict[str, Decimal]] = {}
+    totals: dict[str, Decimal] = {}
+    for row in rows:
+        day = str(row.get("operation_date") or "")
+        curr = row.get("currency") or "UAH"
+        amount = Decimal(str(row.get("amount") or 0))
+        days.setdefault(day, {})[curr] = days.setdefault(day, {}).get(curr, Decimal("0")) + amount
+        totals[curr] = totals.get(curr, Decimal("0")) + amount
+
+    lines = [f"📈 <b>Виручка — {label}</b>", "", "<b>По днях:</b>"]
+    d = start
+    while d <= end:
+        key = d.isoformat()
+        vals = [money(days.get(key, {}).get(c, Decimal("0")), c) for c in ("UAH", "USD", "EUR") if days.get(key, {}).get(c, Decimal("0")) != 0]
+        lines.append(f"• {d.strftime('%d.%m')}: " + (", ".join(vals) if vals else "0 грн"))
+        d += timedelta(days=1)
+
+    lines.append("\n<b>Разом:</b>")
+    if totals:
+        for curr in ("UAH", "USD", "EUR"):
+            if totals.get(curr, Decimal("0")) != 0:
+                lines.append(f"• {money(totals[curr], curr)}")
+    else:
+        lines.append("• 0 грн")
+    return "\n".join(lines)
+
+
 def cards_summary(chat_id: int) -> str:
     """Show all bank/card/FOP accounts and only currencies with non-zero balances."""
     grouped = _group_visible_balances(chat_id, include_cash=False)
@@ -2397,6 +2466,9 @@ HELP_TEXT = """
 <code>звіт</code>
 <code>звіт тиждень</code>
 <code>звіт місяць</code>
+<code>виручка за тиждень</code> — по днях
+<code>виручка 19.08</code> — за конкретний день
+<code>виручка 15.08-20.08</code> — по днях за період
 <code>базар тиждень</code>
 <code>склад місяць</code>
 <code>базар 1-15 серпня</code>
@@ -2467,6 +2539,18 @@ def text_handler(message):
         if low in ("карта", "карти", "картка", "картки", "банки", "рахунки"):
             bot.reply_to(message, cards_summary(message.chat.id))
             return
+
+        # "виручка" with a period is a read-only report; with an amount it remains a write command.
+        revenue_report_match = re.fullmatch(r"виручка(?:\s+за)?\s+(.+)", low)
+        if revenue_report_match and not re.search(r"\d\s*(?:грн|гр|uah|₴|\$|usd|€|eur|дол|євро|евро)", low, flags=re.IGNORECASE):
+            period_text = revenue_report_match.group(1)
+            try:
+                parse_period_spec(period_text)
+            except Exception:
+                pass
+            else:
+                bot.reply_to(message, revenue_period_daily_text(message.chat.id, period_text))
+                return
 
         source_match = re.fullmatch(r"(базар|склад)(?:\s+(.+))?", low)
         if source_match:
