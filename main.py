@@ -5,7 +5,7 @@ import logging
 import json
 import time
 from types import SimpleNamespace
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
@@ -36,7 +36,7 @@ if not SUPABASE_KEY:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 KYIV = ZoneInfo("Europe/Kyiv")
-VERSION = "DvirFinance 6.0-CONTRAGENTS-FIX-20260727"
+VERSION = "DvirFinance 6.1-PERIODS-COMMENTS-20260820"
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_KEY") or os.getenv("OPENAI_TOKEN"))
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-5-mini").strip()
 OPENAI_PROJECT = (os.getenv("OPENAI_PROJECT") or os.getenv("OPENAI_PROJECT_ID") or "").strip()
@@ -125,13 +125,36 @@ def expense_details(text: str) -> dict:
             break
     return {"category": category, "invoice": invoice}
 
+def clean_expense_comment(raw_description: str) -> str:
+    """Keep the human purpose/comment, but remove technical account and invoice tokens."""
+    text = normalize_text(raw_description)
+    # Account phrases are accounting metadata, not the spending comment.
+    patterns = [
+        r"(?:\bз\s+|\bіз\s+|\bзі\s+|\bна\s+|\bз\s+рахунку\s+|\bз\s+карти\s+|\bз\s+картки\s+)?(?:каса|каси|касу|сейф|сейфу|готівка|готівки|готівку|наличка)",
+        r"(?:\bз\s+|\bіз\s+|\bзі\s+|\bна\s+)?(?:картка|картки|карту|карта|карти|карточка|карточки|карточку)\s+(?:миколи|микола|андрія|андрій|андрея)",
+        r"(?:\bз\s+|\bіз\s+|\bзі\s+|\bна\s+)?(?:південний|південного|южний|южного|южный)\s*(?:банк)?\s*(?:миколи|микола|андрія|андрій|андрея)?",
+        r"(?:\bз\s+|\bіз\s+|\bзі\s+|\bна\s+)?(?:приват|приватбанк)\s*(?:миколи|микола|андрія|андрій|андрея)?",
+        r"(?:\bз\s+|\bіз\s+|\bзі\s+|\bна\s+)?\bфоп\b\s*(?:миколи|микола|андрія|андрій|андрея)?",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, " ", text, flags=re.IGNORECASE)
+    # Invoice is stored in its own field inside description, so do not duplicate it in comment.
+    text = re.sub(
+        r"(?:накладн(?:а|ої|ій|ою)?|нк|invoice|прихідн(?:а|ої|ій)?|приф(?:і|а)?)\s*[№#:]?\s*[a-zа-яіїєґ0-9\-/]+",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", text))
+    return text
+
+
 def structured_expense_description(raw_description: str) -> tuple[str, dict]:
     details = expense_details(raw_description)
+    comment = clean_expense_comment(raw_description) or details['category']
+    details['comment'] = comment
     parts = [f"Категорія: {details['category']}"]
     if details.get("invoice"):
         parts.append(f"Накладна: {details['invoice']}")
-    cleaned = normalize_text(raw_description) or details['category']
-    parts.append(cleaned)
+    parts.append(f"Коментар: {comment}")
     return " | ".join(parts), details
 
 def expense_preview_text(command: str) -> str:
@@ -144,6 +167,7 @@ def expense_preview_text(command: str) -> str:
             description = description[:match.start()] + " " + description[match.end():]
         description = normalize_text(re.sub(r"^[,;:\-]+|[,;:\-]+$", "", description))
         details = expense_details(description)
+        comment = clean_expense_comment(description) or details['category']
         display_account = "Каса" if account_name == "Сейф" else account_name
         lines = ["🧾 <b>Перевір витрату</b>", ""]
         lines += [f"➖ <b>{money(a, c)}</b>" for a,c,_ in amounts]
@@ -151,7 +175,7 @@ def expense_preview_text(command: str) -> str:
         lines.append(f"📂 Категорія: <b>{details['category']}</b>")
         if details.get('invoice'):
             lines.append(f"📄 Накладна: <b>{details['invoice']}</b>")
-        lines.append(f"📝 Призначення: {description or details['category']}")
+        lines.append(f"📝 Коментар: {comment}")
         lines.append("\nНічого ще не записано.")
         return "\n".join(lines)
     except Exception:
@@ -178,7 +202,9 @@ def expense_report_text(chat_id: int, category_filter: str | None = None) -> str
         totals[key]=totals.get(key,Decimal("0"))+Decimal(str(row.get("amount") or 0))
         if len(recent)<10:
             inv=re.search(r"Накладна:\s*([^|]+)",desc,flags=re.IGNORECASE)
-            recent.append((row,cat,normalize_text(inv.group(1)) if inv else None))
+            cm=re.search(r"Коментар:\s*([^|]+)",desc,flags=re.IGNORECASE)
+            comment = normalize_text(cm.group(1)) if cm else clean_expense_comment(desc)
+            recent.append((row,cat,normalize_text(inv.group(1)) if inv else None,comment))
     if not totals:
         return "Витрат за цим запитом не знайдено."
     title = f"📊 <b>Витрати — {category_filter}</b>" if category_filter else "📊 <b>Витрати за категоріями</b>"
@@ -188,10 +214,11 @@ def expense_report_text(chat_id: int, category_filter: str | None = None) -> str
         vals=[money(totals[(cat,c)],c) for c in ("UAH","USD","EUR") if (cat,c) in totals]
         lines.append(f"• <b>{cat}</b>: " + ", ".join(vals))
     lines.append("\n<b>Останні витрати:</b>")
-    for row,cat,inv in recent:
+    for row,cat,inv,comment in recent:
         account = row.get('account_name') or 'Каса'
         detail=f" · накладна {inv}" if inv else ""
-        lines.append(f"• {money(row.get('amount'),row.get('currency') or 'UAH')} · {cat}{detail} · {account}")
+        note=f" · {comment}" if comment else ""
+        lines.append(f"• {money(row.get('amount'),row.get('currency') or 'UAH')} · {cat}{detail}{note} · {account}")
     return "\n".join(lines)
 
 # ------------------------ Supabase ------------------------
@@ -585,11 +612,13 @@ def handle_income_expense(message, text: str) -> bool:
         extra = f"\n📂 Категорія: {expense_meta['category']}"
         if expense_meta.get('invoice'):
             extra += f"\n📄 Накладна: {expense_meta['invoice']}"
+        if expense_meta.get('comment'):
+            extra += f"\n📝 Коментар: {expense_meta['comment']}"
     bot.reply_to(
         message,
         f"{title}\n\n{amounts_text}\n"
         f"📍 {account_line}: {display_account}"
-        f"{extra}\n📝 {description}",
+        f"{extra}" + (f"\n📝 {description}" if operation_type == "income" else ""),
     )
     return True
 
@@ -809,68 +838,11 @@ def handle_revision(message, text: str) -> bool:
 
 # ------------------------ Debts ------------------------
 
-PERSON_ENDINGS = (
-    "ові", "еві", "єві", "ому", "ему",
-    "ами", "ями", "ах", "ях",
-    "ою", "ею", "єю",
-    "ові", "еві",
-    "ий", "ій", "ої", "ій",
-    "а", "я", "у", "ю", "і", "и", "е", "о",
-)
-
-def person_lookup_key(raw_name: str) -> str:
-    """Conservative lookup key for Ukrainian/Russian name inflections.
-
-    Examples: Наталя/Наталі/Наталю -> натал; Болена/Болени/Болену -> болен;
-    Боря/боря/Борю -> бор. Exact text is still preferred before this key.
-    """
-    text = normalize_text(raw_name).casefold().replace("ё", "е")
-    text = re.sub(r"[^0-9a-zа-яіїєґ' -]+", " ", text, flags=re.IGNORECASE)
-    words = [w.strip("'-") for w in text.split() if w.strip("'-")]
-    stems = []
-    for word in words:
-        stem = word
-        if len(stem) >= 3:
-            for ending in PERSON_ENDINGS:
-                if stem.endswith(ending) and len(stem) - len(ending) >= 2:
-                    stem = stem[:-len(ending)]
-                    break
-        stems.append(stem)
-    return " ".join(stems)
-
-def resolve_customer_rows(rows, customer_query: str):
-    """Return matching rows only when the person can be resolved unambiguously."""
-    query_text = normalize_text(customer_query).casefold()
-    exact = [r for r in rows if normalize_text(r.get("customer_name", "")).casefold() == query_text]
-    if exact:
-        return exact
-
-    query_key = person_lookup_key(customer_query)
-    keyed = [r for r in rows if query_key and person_lookup_key(r.get("customer_name", "")) == query_key]
-    if keyed:
-        unique_names = {normalize_text(r.get("customer_name", "")).casefold() for r in keyed}
-        # Different case/inflection spellings of the same key are one counterparty.
-        return keyed if len({person_lookup_key(n) for n in unique_names}) == 1 else []
-
-    partial = [r for r in rows if query_text and query_text in normalize_text(r.get("customer_name", "")).casefold()]
-    names = {normalize_text(r.get("customer_name", "")).casefold() for r in partial}
-    return partial if len(names) == 1 else []
-
-def existing_customer_display_name(chat_id: int, proposed_name: str) -> str:
-    """Reuse the spelling already present in history to avoid Боря/боря duplicates."""
-    rows = sb_select("customer_debts", {
-        "select": "customer_name",
-        "telegram_chat_id": f"eq.{chat_id}",
-        "order": "created_at.asc",
-    })
-    matches = resolve_customer_rows(rows, proposed_name)
-    return normalize_text(matches[0]["customer_name"]) if matches else normalize_text(proposed_name)
-
 def create_debt(message, customer_name: str, amount: Decimal, currency: str, description: str):
     payload = {
         "debt_date": today_str(),
         "telegram_chat_id": message.chat.id,
-        "customer_name": existing_customer_display_name(message.chat.id, customer_name),
+        "customer_name": normalize_text(customer_name),
         "description": description or None,
         "currency": currency,
         "original_amount": float(amount),
@@ -955,6 +927,66 @@ def handle_debt_create(message, text: str) -> bool:
     return True
 
 
+def _person_name_key(value: str) -> str:
+    """Stable comparison key for debtor names without changing stored display text.
+
+    Handles capitalization and common Ukrainian/Russian case endings:
+    Наталя/Наталі/Наталю, Болена/Болени/Болену, Боря/борі/борю.
+    This is deliberately conservative: it never auto-merges different multi-word names.
+    """
+    value = normalize_text(value).casefold().replace("ё", "е")
+    value = re.sub(r"[^0-9a-zа-яіїєґ' -]+", "", value)
+    parts = [p for p in value.split() if p]
+    result = []
+    for part in parts:
+        token = part.strip("'-")
+        if len(token) >= 5:
+            # Longer endings first. Keep at least four letters to avoid overmatching.
+            for ending in (
+                "ями", "ами", "ові", "еві", "єві", "ого", "ому", "ему",
+                "ою", "ею", "єю", "ові", "еві", "ів", "їв",
+                "а", "я", "і", "ї", "и", "у", "ю", "е", "є", "о",
+            ):
+                if token.endswith(ending) and len(token) - len(ending) >= 4:
+                    token = token[:-len(ending)]
+                    break
+        result.append(token)
+    return " ".join(result)
+
+
+def _matched_debt_names(rows, customer_query: str):
+    query_text = normalize_text(customer_query)
+    query_fold = query_text.casefold()
+    query_key = _person_name_key(query_text)
+
+    # 1. Exact text, ignoring case and spaces.
+    exact_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if normalize_text(r["customer_name"]).casefold() == query_fold
+    }
+    if exact_names:
+        return exact_names
+
+    # 2. Same conservative grammatical key. This merges case forms, not arbitrary people.
+    keyed_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if _person_name_key(r["customer_name"]) == query_key and query_key
+    }
+    if keyed_names:
+        return keyed_names
+
+    # 3. Unique partial textual match only.
+    partial_names = {
+        normalize_text(r["customer_name"]).casefold()
+        for r in rows
+        if query_fold in normalize_text(r["customer_name"]).casefold()
+        or normalize_text(r["customer_name"]).casefold() in query_fold
+    }
+    return partial_names if len(partial_names) == 1 else set()
+
+
 def find_open_debts(chat_id: int, customer_query: str | None = None):
     params = {
         "select": "*",
@@ -965,7 +997,11 @@ def find_open_debts(chat_id: int, customer_query: str | None = None):
     }
     rows = sb_select("customer_debts", params)
     if customer_query:
-        return resolve_customer_rows(rows, customer_query)
+        matched_names = _matched_debt_names(rows, customer_query)
+        return [
+            r for r in rows
+            if normalize_text(r["customer_name"]).casefold() in matched_names
+        ]
     return rows
 
 
@@ -1046,6 +1082,7 @@ def handle_debt_payment(message, text: str) -> bool:
         return True
 
     outstanding_total = sum_rows(debts, "outstanding_amount")
+    canonical_customer = normalize_text(debts[0]["customer_name"])
     if amount > outstanding_total:
         bot.reply_to(
             message,
@@ -1097,11 +1134,10 @@ def handle_debt_payment(message, text: str) -> bool:
 
     left = outstanding_total - amount
     display_account = "Каса" if account_name == "Сейф" else account_name
-    display_customer = normalize_text(debts[0]["customer_name"])
     bot.reply_to(
         message,
         f"✅ Повернення боргу записано\n\n"
-        f"👤 {display_customer}\n"
+        f"👤 {canonical_customer}\n"
         f"➖ Борг зменшено на: <b>{money(amount, currency)}</b>\n"
         f"📍 Гроші зараховано: {display_account}\n"
         f"📒 Залишок боргу: {money(left, currency)}",
@@ -1817,23 +1853,107 @@ def _group_visible_balances(chat_id: int, include_cash: bool) -> dict:
 
 
 
-def source_month_summary(chat_id: int, source: str) -> str:
-    """Monthly revenue by source. Source is analytics only; money remains on its real account."""
-    now = datetime.now(KYIV)
-    month_start = now.replace(day=1).date().isoformat()
+MONTHS_UA = {
+    "січня": 1, "січень": 1, "января": 1,
+    "лютого": 2, "лютий": 2, "февраля": 2,
+    "березня": 3, "березень": 3, "марта": 3,
+    "квітня": 4, "квітень": 4, "апреля": 4,
+    "травня": 5, "травень": 5, "мая": 5,
+    "червня": 6, "червень": 6, "июня": 6,
+    "липня": 7, "липень": 7, "июля": 7,
+    "серпня": 8, "серпень": 8, "августа": 8,
+    "вересня": 9, "вересень": 9, "сентября": 9,
+    "жовтня": 10, "жовтень": 10, "октября": 10,
+    "листопада": 11, "листопад": 11, "ноября": 11,
+    "грудня": 12, "грудень": 12, "декабря": 12,
+}
+
+
+def parse_period_spec(raw: str, now: datetime | None = None) -> tuple[date, date, str]:
+    """Parse friendly Ukrainian report periods without involving AI."""
+    now = now or datetime.now(KYIV)
+    today = now.date()
+    text = normalize_text(raw).lower().strip(" ,.;")
+    if not text or text in ("місяць", "за місяць", "поточний місяць", "цей місяць"):
+        start = today.replace(day=1)
+        return start, today, f"{start.strftime('%d.%m.%Y')}–{today.strftime('%d.%m.%Y')}"
+    if text in ("сьогодні", "за сьогодні", "сегодня"):
+        return today, today, today.strftime("%d.%m.%Y")
+    if text in ("вчора", "за вчора", "вчера"):
+        d = today - timedelta(days=1)
+        return d, d, d.strftime("%d.%m.%Y")
+    if text in ("тиждень", "за тиждень", "7 днів", "за 7 днів", "неділя", "неделя"):
+        start = today - timedelta(days=6)
+        return start, today, f"{start.strftime('%d.%m.%Y')}–{today.strftime('%d.%m.%Y')}"
+
+    # 01.08.2026-15.08.2026 or 01.08-15.08
+    m = re.fullmatch(r"(?:з\s*)?(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s*(?:-|–|—|по|до)\s*(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", text)
+    if m:
+        d1, mo1, y1, d2, mo2, y2 = m.groups()
+        y1 = int(y1) if y1 else today.year
+        y2 = int(y2) if y2 else y1
+        if y1 < 100: y1 += 2000
+        if y2 < 100: y2 += 2000
+        start, end = date(y1, int(mo1), int(d1)), date(y2, int(mo2), int(d2))
+        if end < start: raise ValueError("Кінцева дата не може бути раніше початкової")
+        return start, end, f"{start.strftime('%d.%m.%Y')}–{end.strftime('%d.%m.%Y')}"
+
+    # 01.08.2026 or 01.08
+    m = re.fullmatch(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", text)
+    if m:
+        d, mo, y = m.groups(); y = int(y) if y else today.year
+        if y < 100: y += 2000
+        one = date(y, int(mo), int(d))
+        return one, one, one.strftime("%d.%m.%Y")
+
+    # 1-15 серпня [2026], з 1 по 15 серпня
+    months = "|".join(map(re.escape, MONTHS_UA.keys()))
+    m = re.fullmatch(rf"(?:з\s*)?(\d{{1,2}})\s*(?:-|–|—|по|до)\s*(\d{{1,2}})\s+({months})(?:\s+(\d{{4}}))?", text)
+    if m:
+        d1, d2, month_word, year = m.groups(); year = int(year or today.year)
+        month = MONTHS_UA[month_word]
+        start, end = date(year, month, int(d1)), date(year, month, int(d2))
+        if end < start: raise ValueError("Кінцева дата не може бути раніше початкової")
+        return start, end, f"{start.strftime('%d.%m.%Y')}–{end.strftime('%d.%m.%Y')}"
+
+    # 1-15 means days of the current month.
+    m = re.fullmatch(r"(?:з\s*)?(\d{1,2})\s*(?:-|–|—|по|до)\s*(\d{1,2})", text)
+    if m:
+        start = date(today.year, today.month, int(m.group(1)))
+        end = date(today.year, today.month, int(m.group(2)))
+        if end < start: raise ValueError("Кінцева дата не може бути раніше початкової")
+        return start, end, f"{start.strftime('%d.%m.%Y')}–{end.strftime('%d.%m.%Y')}"
+
+    # 15 серпня [2026]
+    m = re.fullmatch(rf"(\d{{1,2}})\s+({months})(?:\s+(\d{{4}}))?", text)
+    if m:
+        d, month_word, year = m.groups(); year = int(year or today.year)
+        one = date(year, MONTHS_UA[month_word], int(d))
+        return one, one, one.strftime("%d.%m.%Y")
+
+    raise ValueError("Період не зрозумів. Приклад: базар тиждень; склад місяць; базар 1-15 серпня; склад 01.08-15.08")
+
+
+def _income_rows_for_period(chat_id: int, start: date, end: date) -> list:
     rows = sb_select("cash_operations", {
-        "select": "operation_date,amount,currency,description,account_name",
+        "select": "operation_date,amount,currency,description,account_name,created_at",
         "telegram_chat_id": f"eq.{chat_id}",
         "operation_type": "eq.income",
         "is_cancelled": "eq.false",
-        "operation_date": f"gte.{month_start}",
+        "operation_date": f"gte.{start.isoformat()}",
         "order": "operation_date.asc,created_at.asc",
-        "limit": "1000",
+        "limit": "5000",
     })
+    return [r for r in rows if str(r.get("operation_date") or "") <= end.isoformat()]
+
+
+def source_period_summary(chat_id: int, source: str, period_raw: str = "") -> str:
+    """Revenue by Bazar/Sklad for any date range. Source stays analytics, never an account."""
+    start, end, label = parse_period_spec(period_raw)
+    rows = _income_rows_for_period(chat_id, start, end)
     needle = source.lower()
     matched = [r for r in rows if re.search(rf"(?<![\wа-яіїєґ]){re.escape(needle)}(?![\wа-яіїєґ])", (r.get("description") or "").lower(), flags=re.IGNORECASE)]
-    totals = {}
-    accounts = {}
+    totals, accounts, days = {}, {}, {}
     for row in matched:
         currency = row.get("currency") or "UAH"
         amount = Decimal(str(row.get("amount") or 0))
@@ -1841,20 +1961,53 @@ def source_month_summary(chat_id: int, source: str) -> str:
         account = canonical_account_name(row.get("account_name") or "Сейф")
         display = "Каса" if account == "Сейф" else account
         accounts.setdefault(display, {})[currency] = accounts.setdefault(display, {}).get(currency, Decimal("0")) + amount
+        day = str(row.get("operation_date"))
+        days.setdefault(day, {})[currency] = days.setdefault(day, {}).get(currency, Decimal("0")) + amount
 
     title = source.capitalize()
     if not matched:
-        return f"📊 <b>{title} — поточний місяць</b>\n\nВиручки ще не записано."
-    lines = [f"📊 <b>{title} — поточний місяць</b>", ""]
+        return f"📊 <b>{title} — {label}</b>\n\nВиручки за цей період не записано."
+    lines = [f"📊 <b>{title} — {label}</b>", "", "<b>Разом:</b>"]
     for currency in ("UAH", "USD", "EUR"):
-        if totals.get(currency):
-            lines.append(f"• {money(totals[currency], currency)}")
+        if totals.get(currency): lines.append(f"• {money(totals[currency], currency)}")
+    if len(days) > 1:
+        lines.append("\n<b>По днях:</b>")
+        for day in sorted(days):
+            vals = [money(days[day][c], c) for c in ("UAH","USD","EUR") if days[day].get(c)]
+            lines.append(f"• {date.fromisoformat(day).strftime('%d.%m')}: " + ", ".join(vals))
     lines.append("\n<b>Куди зараховано:</b>")
     for account in sorted(accounts, key=str.lower):
-        values = [money(accounts[account][c], c) for c in ("UAH", "USD", "EUR") if accounts[account].get(c)]
-        lines.append(f"• {account}: " + ", ".join(values))
+        vals = [money(accounts[account][c], c) for c in ("UAH","USD","EUR") if accounts[account].get(c)]
+        lines.append(f"• {account}: " + ", ".join(vals))
     lines.append("\n<i>Базар і Склад — джерела виручки, а не окремі грошові рахунки.</i>")
     return "\n".join(lines)
+
+
+def source_month_summary(chat_id: int, source: str) -> str:
+    return source_period_summary(chat_id, source, "місяць")
+
+
+def report_period_text(chat_id: int, period_raw: str = "") -> str:
+    start, end, label = parse_period_spec(period_raw or "сьогодні")
+    rows = sb_select("cash_operations", {
+        "select": "operation_date,operation_type,amount,currency",
+        "telegram_chat_id": f"eq.{chat_id}", "is_cancelled": "eq.false",
+        "operation_date": f"gte.{start.isoformat()}", "order": "operation_date.asc", "limit": "5000",
+    })
+    rows = [r for r in rows if str(r.get("operation_date") or "") <= end.isoformat()]
+    totals = {}
+    for row in rows:
+        curr = row.get("currency") or "UAH"
+        totals.setdefault(curr, {"income": Decimal("0"), "expense": Decimal("0")})
+        if row.get("operation_type") == "income": totals[curr]["income"] += Decimal(str(row.get("amount") or 0))
+        elif row.get("operation_type") == "expense": totals[curr]["expense"] += Decimal(str(row.get("amount") or 0))
+    if not totals: return f"За період {label} операцій ще немає."
+    lines=[f"📊 <b>Звіт — {label}</b>",""]
+    for curr in ("UAH","USD","EUR"):
+        if curr not in totals: continue
+        data=totals[curr]
+        lines += [f"<b>{curr}</b>", f"Виручка: {money(data['income'],curr)}", f"Витрати: {money(data['expense'],curr)}", f"Рух: {money(data['income']-data['expense'],curr)}", ""]
+    return "\n".join(lines).strip()
 
 
 def cards_summary(chat_id: int) -> str:
@@ -2242,6 +2395,11 @@ HELP_TEXT = """
 <code>борги</code>
 <code>каса</code>
 <code>звіт</code>
+<code>звіт тиждень</code>
+<code>звіт місяць</code>
+<code>базар тиждень</code>
+<code>склад місяць</code>
+<code>базар 1-15 серпня</code>
 <code>витрати</code> — підсумок за категоріями
 <code>витрати зарплата</code>
 <code>витрати товар</code>
@@ -2310,12 +2468,15 @@ def text_handler(message):
             bot.reply_to(message, cards_summary(message.chat.id))
             return
 
-        if low in ("базар", "склад"):
-            bot.reply_to(message, source_month_summary(message.chat.id, low))
+        source_match = re.fullmatch(r"(базар|склад)(?:\s+(.+))?", low)
+        if source_match:
+            bot.reply_to(message, source_period_summary(message.chat.id, source_match.group(1), source_match.group(2) or "місяць"))
             return
 
-        if low in ("звіт", "отчет"):
-            bot.reply_to(message, report_text(message.chat.id))
+        report_match = re.fullmatch(r"(?:звіт|отчет)(?:\s+(.+))?", low)
+        if report_match:
+            period = report_match.group(1) or "сьогодні"
+            bot.reply_to(message, report_period_text(message.chat.id, period))
             return
 
         expense_match = re.fullmatch(r"витрати(?:\s+(.+))?", low)
